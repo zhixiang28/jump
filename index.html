@@ -1,0 +1,167 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+<title>跳一跳 实时提示</title>
+<style>
+  :root{--bg:#0b120e;--ink:#eaf5ee;--mute:#9bb5a4;--acc:#4ade80;--yel:#facc15;--blue:#60a5fa;--red:#f87171}
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:14px/1.4 -apple-system,"PingFang SC","Noto Sans SC",sans-serif;overflow:hidden}
+  #app{display:flex;flex-direction:column;height:100%}
+  #view{position:relative;flex:1;min-height:0;background:#000;touch-action:none}
+  video,#frz,#ov{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+  #frz{display:none}
+  #ov{pointer-events:none}
+  #msg{position:absolute;left:8px;right:8px;top:8px;background:rgba(0,0,0,.6);padding:6px 10px;border-radius:10px;color:var(--yel);font-weight:600;text-align:center}
+  #ms{position:absolute;right:10px;bottom:10px;background:rgba(0,0,0,.65);padding:4px 12px;border-radius:12px;font-size:30px;font-weight:800;color:var(--yel)}
+  #bar{display:flex;gap:6px;padding:6px;background:#111c15}
+  #bar button{flex:1;border:0;border-radius:10px;padding:9px 4px;font:inherit;font-weight:700;background:#25392c;color:var(--ink)}
+  #bar button.pri{background:var(--acc);color:#06210f}
+  #bar button.blue{background:var(--blue);color:#061528}
+  #pad{height:26vh;margin:0 6px 6px;border-radius:18px;background:#25392c;position:relative;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;touch-action:none}
+  #pad.go{background:var(--acc)} #pad.go *{color:#06210f!important}
+  #fill{position:absolute;left:0;bottom:0;width:100%;height:0;background:rgba(250,204,21,.28)}
+  #padTxt{position:relative;font-size:28px;font-weight:800}
+  #padSub{position:relative;color:var(--mute);font-size:13px}
+  #kbox{position:absolute;left:10px;bottom:10px;background:rgba(0,0,0,.65);padding:3px 8px;border-radius:8px;color:var(--mute);font-size:12px}
+  #start{position:absolute;inset:0;display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;background:var(--bg);z-index:5;padding:24px;text-align:center}
+  #start button{border:0;border-radius:14px;padding:14px 22px;font:inherit;font-size:17px;font-weight:800;background:var(--acc);color:#06210f}
+  #start p{color:var(--mute);margin:0}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="view">
+    <video id="vid" playsinline muted autoplay></video>
+    <canvas id="frz"></canvas>
+    <svg id="ov"></svg>
+    <div id="msg">…</div>
+    <div id="ms">— ms</div>
+    <div id="kbox">k=—</div>
+    <div id="start">
+      <div style="font-size:22px;font-weight:800">🦌 跳一跳 实时提示</div>
+      <p>把这部手机架在游戏手机上方，镜头对准游戏画面，尽量正对、别晃。</p>
+      <button id="go">打开相机</button>
+      <p id="err" style="color:#f87171"></p>
+    </div>
+  </div>
+  <div id="bar">
+    <button id="edge" class="blue">设边框</button>
+    <button id="short">近了</button>
+    <button id="ok" class="pri">刚好</button>
+    <button id="long">远了</button>
+    <button id="snd">🔊</button>
+  </div>
+  <div id="pad"><div id="fill"></div><div id="padTxt">按住</div><div id="padSub">和游戏同时按，“嘀”就一起松</div></div>
+</div>
+
+<script>
+const $=id=>document.getElementById(id);
+const store={get(k,d){try{const v=localStorage.getItem(k);return v==null?d:JSON.parse(v)}catch(e){return d}},set(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
+const vid=$('vid'),frz=$('frz'),ov=$('ov'),view=$('view');
+let K=store.get('jumpK',1500), edges=store.get('jumpEdges',null); // edges in video-normalized coords
+let mode=edges?'jump':'edge', tmp=[], jumpPts=[], T=null, sound=true;
+
+// ---------- camera ----------
+$('go').onclick=async()=>{
+  ensureAudio();
+  try{
+    const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},audio:false});
+    vid.srcObject=s;await vid.play();$('start').style.display='none';
+    try{const tr=s.getVideoTracks()[0];const c=tr.getCapabilities?tr.getCapabilities():{};if(c.focusMode&&c.focusMode.includes('continuous'))tr.applyConstraints({advanced:[{focusMode:'continuous'}]});}catch(e){}
+    refresh();
+  }catch(e){$('err').textContent='打不开相机：'+(e.message||e.name)+'。要用 https 网址打开（比如 GitHub Pages），并允许相机权限。';}
+};
+
+// displayed video rect (object-fit:contain)
+function vrect(){
+  const W=view.clientWidth,H=view.clientHeight,vw=vid.videoWidth||16,vh=vid.videoHeight||9;
+  const s=Math.min(W/vw,H/vh),w=vw*s,h=vh*s;return{x:(W-w)/2,y:(H-h)/2,w,h,vw,vh};
+}
+function toNorm(cx,cy){const b=view.getBoundingClientRect(),r=vrect();return{x:(cx-b.left-r.x)/r.w,y:(cy-b.top-r.y)/r.h};}
+function toScr(p){const r=vrect();return{x:r.x+p.x*r.w,y:r.y+p.y*r.h};}
+function dist(a,b){const r=vrect();return Math.hypot((b.x-a.x)*r.vw,(b.y-a.y)*r.vh);} // in video pixels
+
+function freeze(){const r=vrect();frz.width=view.clientWidth;frz.height=view.clientHeight;const c=frz.getContext('2d');c.clearRect(0,0,frz.width,frz.height);c.drawImage(vid,r.x,r.y,r.w,r.h);frz.style.display='block';}
+function unfreeze(){frz.style.display='none';}
+
+view.addEventListener('pointerdown',e=>{
+  if($('start').style.display!=='none')return;
+  const p=toNorm(e.clientX,e.clientY);if(p.x<0||p.x>1||p.y<0||p.y>1)return;
+  if(mode==='edge'){
+    tmp.push(p);
+    if(tmp.length===2){edges=tmp;tmp=[];store.set('jumpEdges',edges);mode='jump';}
+  }else{
+    if(jumpPts.length>=2)jumpPts=[];
+    if(jumpPts.length===0)freeze();
+    jumpPts.push(p);
+    if(jumpPts.length===2){
+      const w=dist(edges[0],edges[1]);
+      if(w<20){mode='edge';edges=null;jumpPts=[];unfreeze();refresh();return;}
+      const frac=dist(jumpPts[0],jumpPts[1])/w;
+      T=Math.round(K*frac);T0frac=frac;
+      setTimeout(unfreeze,250);
+    }
+  }
+  refresh();
+});
+let T0frac=null;
+
+$('edge').onclick=()=>{mode='edge';tmp=[];jumpPts=[];unfreeze();refresh();};
+
+function refresh(){
+  const m=$('msg');
+  if(mode==='edge')m.textContent=tmp.length===0?'设边框：点游戏画面左边缘':'再点游戏画面右边缘（同一高度）';
+  else if(jumpPts.length===0)m.textContent='点角色脚底（画面会暂停）';
+  else if(jumpPts.length===1)m.textContent='点目标平台顶面中心';
+  else m.textContent=`距离 ${(T0frac*100).toFixed(0)}% 屏宽 → 按 ${(T/1000).toFixed(2)} 秒`;
+  $('ms').textContent=T?T+' ms':'— ms';
+  $('kbox').textContent='k='+K;
+  drawOv();
+}
+function drawOv(){
+  ov.setAttribute('viewBox',`0 0 ${view.clientWidth} ${view.clientHeight}`);
+  let s='';const dot=(p,c)=>{const q=toScr(p);return`<circle cx="${q.x}" cy="${q.y}" r="9" fill="${c}" stroke="#fff" stroke-width="2"/>`};
+  const ln=(a,b,c)=>{const p=toScr(a),q=toScr(b);return`<line x1="${p.x}" y1="${p.y}" x2="${q.x}" y2="${q.y}" stroke="${c}" stroke-width="3" stroke-dasharray="6 5"/>`};
+  const E=mode==='edge'?tmp:(edges||[]);
+  if(E.length===2)s+=ln(E[0],E[1],'#60a5fa');E.forEach(p=>s+=dot(p,'#60a5fa'));
+  if(jumpPts.length===2)s+=ln(jumpPts[0],jumpPts[1],'#facc15');
+  jumpPts.forEach((p,i)=>s+=dot(p,i?'#facc15':'#f87171'));
+  ov.innerHTML=s;
+}
+window.addEventListener('resize',refresh);
+
+// ---------- calibration ----------
+function setK(v){K=Math.round(Math.max(300,Math.min(5000,v)));store.set('jumpK',K);if(T0frac!=null)T=Math.round(K*T0frac);refresh();}
+$('short').onclick=()=>{setK(K*1.06);jumpPts=[];T=null;T0frac=null;refresh();};
+$('long').onclick=()=>{setK(K*0.94);jumpPts=[];T=null;T0frac=null;refresh();};
+$('ok').onclick=()=>{jumpPts=[];T=null;T0frac=null;refresh();};
+$('snd').onclick=()=>{sound=!sound;$('snd').textContent=sound?'🔊':'🔇';};
+
+// ---------- cue pad ----------
+let actx=null,t0=0,raf=0,down=false,fired=false,timer=0;
+function ensureAudio(){try{if(!actx)actx=new (window.AudioContext||window.webkitAudioContext)();if(actx.state==='suspended')actx.resume();}catch(e){}}
+function beep(){if(!sound||!actx)return;try{const o=actx.createOscillator(),g=actx.createGain();o.type='square';o.frequency.value=1760;g.gain.setValueAtTime(0.0001,actx.currentTime);g.gain.exponentialRampToValueAtTime(0.5,actx.currentTime+0.005);g.gain.exponentialRampToValueAtTime(0.0001,actx.currentTime+0.15);o.connect(g).connect(actx.destination);o.start();o.stop(actx.currentTime+0.16);}catch(e){}}
+const pad=$('pad'),fill=$('fill');
+function loop(){const el=performance.now()-t0;fill.style.height=Math.min(100,el/T*100)+'%';$('padTxt').textContent=Math.round(el)+' ms';raf=requestAnimationFrame(loop);}
+function fire(){if(!down||fired)return;fired=true;beep();pad.classList.add('go');$('padSub').textContent='松手！';try{navigator.vibrate&&navigator.vibrate(60)}catch(e){}}
+pad.addEventListener('pointerdown',e=>{
+  e.preventDefault();ensureAudio();
+  if(!T){$('padSub').textContent='先在画面上点角色和目标';return;}
+  try{pad.setPointerCapture(e.pointerId)}catch(_){}
+  down=true;fired=false;pad.classList.remove('go');t0=performance.now();$('padSub').textContent='等“嘀”…';
+  clearTimeout(timer);timer=setTimeout(fire,Math.max(0,T-10));loop();
+});
+function up(){
+  if(!down)return;down=false;clearTimeout(timer);cancelAnimationFrame(raf);
+  const el=Math.round(performance.now()-t0),d=el-T;fill.style.height='0';pad.classList.remove('go');
+  $('padTxt').textContent=el+' ms';
+  $('padSub').textContent=(Math.abs(d)<=Math.max(40,T*0.06)?'🎯 很准':d<0?'⬇️ 松早了':'⬆️ 松晚了')+`（${d>0?'+':''}${d} ms）→ 跳完按 近了/刚好/远了`;
+}
+pad.addEventListener('pointerup',up);pad.addEventListener('pointercancel',up);
+document.addEventListener('contextmenu',e=>e.preventDefault());
+refresh();
+</script>
+</body>
+</html>
