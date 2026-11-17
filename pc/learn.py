@@ -584,6 +584,77 @@ def find_target(im, foot, angle_deg=30, diff_thr=45):
     return {'center': (cx / Wn, cy / Wn), 'top': (cx / Wn, ty / Wn), 'side': side, 'width': w / Wn, 'method': 'shape'}
 
 
+# ================================================================ 目标记忆
+# 规则（奶油色顶面）偶尔会认错或认不出某种方块。你手动画线时，如果 AI 当时找不到目标、
+# 或 AI 的终点跟你画的差很多，就把你画的终点附近那块方块记下来（含中心在哪里）。
+# 之后遇到同一种方块，就用记忆比对。
+MEM_W, MEM_H = 0.34, 0.26          # 记忆样板大小（屏宽比例），中心放在样板中间偏下一点
+MEM_DISAGREE = 0.05                # AI 跟你画的终点差超过屏宽的 5% 才算「AI 不会」
+
+
+def build_target_memory(store, max_n=20, scan=150):
+    mem = []
+    tw, th = round(MEM_W * NW), round(MEM_H * NW)
+    for rec in reversed(store.recs):
+        scan -= 1
+        if scan <= 0 or len(mem) >= max_n:
+            break
+        if rec.get('auto'):
+            continue
+        p = rec.get('pred') or {}
+        b = rec['b']
+        if p.get('center') and math.hypot(p['center'][0] - b[0], p['center'][1] - b[1]) <= MEM_DISAGREE:
+            continue                                   # AI 当时就对了，不用记
+        try:
+            img = as_arr(store.shot(rec), NW)
+        except Exception:  # noqa: BLE001
+            continue
+        cx, cy = b[0] * NW, b[1] * NW
+        x0, y0 = round(cx - tw / 2), round(cy - th * 0.55)
+        if x0 < 0 or y0 < 0 or x0 + tw > img.shape[1] or y0 + th > img.shape[0]:
+            continue
+        crop = img[y0:y0 + th, x0:x0 + tw]
+        if any(ncc_at(crop, M['t'], 0, 0) > 0.9 for M in mem):
+            continue                                   # 这种方块已经记过了
+        mem.append({'t': crop, 'half': half(crop), 'cx': cx - x0, 'cy': cy - y0, 'id': rec['id']})
+    return mem
+
+
+def find_target_memory(im, foot, mem, angle_deg=30):
+    """在小人斜上方、靠近跳跃线的地方找记忆里的方块。回传 {'center', 'score', 'side'} 或 None。"""
+    if not mem:
+        return None
+    small = as_arr(im, NW // 2)
+    Wn = small.shape[1]
+    fx, fy = foot[0] * Wn, foot[1] * Wn
+    ya, yb = max(0, int(fy - 0.85 * Wn)), int(fy + 0.05 * Wn)
+    reg = small[ya:yb]
+    t = math.tan(math.radians(angle_deg))
+    best = None
+    for M in mem:
+        m = ncc_map(reg, M['half'])
+        if m is None:
+            continue
+        # 只接受中心落在跳跃线附近、在小人斜上方的位置
+        hh, ww = m.shape
+        ys, xs = np.mgrid[0:hh, 0:ww]
+        ccx = xs + M['cx'] / 2
+        ccy = ys + ya + M['cy'] / 2
+        dx, dy = ccx - fx, fy - ccy
+        ok = (np.abs(dx) >= 0.12 * Wn) & (dy > 0) & (np.abs(dy - np.abs(dx) * t) <= 0.06 * Wn + 0.12 * np.abs(dx) * t)
+        if not ok.any():
+            continue
+        mm = np.where(ok, m, -2)
+        y, x = np.unravel_index(int(np.argmax(mm)), mm.shape)
+        sc = float(mm[y, x])
+        if best is None or sc > best[0]:
+            best = (sc, (ccx[y, x]) / Wn, (ccy[y, x]) / Wn, M['id'])
+    if not best:
+        return None
+    sc, cx, cy, mid = best
+    return {'center': (cx, cy), 'score': sc, 'side': 1 if cx > foot[0] else -1, 'mem_id': mid}
+
+
 # ================================================================ 预测 / 统计
 def shadow_stats(store, n=10):
     """最近 n 笔「你画线、AI 也有预测」的纪录：AI 距离 / 你的距离 的误差。"""
@@ -612,7 +683,7 @@ def learned_angle(store, n=20):
     return float(np.median(angs)) if len(angs) >= 5 else None
 
 
-def predict(im, tpls, cfg, store, char_thr=0.55, ch=None):
+def predict(im, tpls, cfg, store, char_thr=0.55, ch=None, mem=None):
     """回传预测 dict（失败时 'err' 说明原因）。ch：已经找过的小人（省一次）。"""
     ch = ch or find_char(im, tpls)
     if not ch:
@@ -621,6 +692,14 @@ def predict(im, tpls, cfg, store, char_thr=0.55, ch=None):
         return {'err': f'找不到小人（信心 {ch["score"]:.2f}）', 'score': ch['score']}
     ang = learned_angle(store) or cfg.get('jump_angle_deg', 30)
     tg = find_target(im, ch['foot'], ang)
+    if mem:
+        mm = find_target_memory(im, ch['foot'], mem, ang)
+        if mm:
+            far = (not tg) or math.hypot(mm['center'][0] - tg['center'][0], mm['center'][1] - tg['center'][1]) > 0.06
+            # 规则找不到 → 记忆够像就用；规则找到但跟「你纠正过的那种方块」很像却不同位置 → 相信记忆
+            if (not tg and mm['score'] >= 0.75) or (tg and far and mm['score'] >= 0.93):
+                tg = {'center': mm['center'], 'top': mm['center'], 'side': mm['side'],
+                      'width': (tg or {}).get('width', 0.3), 'method': 'memory', 'mem_score': mm['score']}
     if not tg:
         return {'err': '找不到目标方块', 'foot': ch['foot'], 'score': ch['score']}
     fx, fy = ch['foot']
@@ -634,11 +713,10 @@ def predict(im, tpls, cfg, store, char_thr=0.55, ch=None):
     # 依你的画线习惯修正比例；一旦有足够的落点资料（真正的物理结果），就不需要了
     corr = st['ratio'] if st['n'] >= 5 and land_count(store) < MIN_LAND else 1.0
     units = raw_units * corr
-    ms = units * cfg['k'] + cfg['b']
-    ms = int(round(max(cfg['min_ms'], min(cfg['max_ms'], ms))))
+    ms = ms_for(units, tg['side'], fy, cfg)
     return {'foot': ch['foot'], 'center': tg['center'], 'top': tg['top'], 'side': tg['side'],
             'score': ch['score'], 'raw_units': raw_units, 'units': units, 'corr': corr, 'ms': ms, 'angle': ang,
-            'width': tg.get('width', 0)}
+            'width': tg.get('width', 0), 'method': tg.get('method', 'face'), 'mem_score': tg.get('mem_score')}
 
 
 MIN_LAND = 6
@@ -648,28 +726,78 @@ def land_count(store):
     return sum(1 for r in store.recs if r.get('land'))
 
 
-def fit_land(store, n=40):
-    """用量到的落点拟合：按了 ms → 实际跳了 traveled。ms = k × traveled + b。"""
-    pts = [(r['land']['traveled'], r['ms']) for r in store.recs if r.get('land')][-n:]
-    if len(pts) < MIN_LAND:
-        return None
-    x = np.array([p[0] for p in pts], float)
-    y = np.array([p[1] for p in pts], float)
-    if x.max() - x.min() < 80:
-        return None
-    keep = np.ones(len(x), bool)
+def _jump_side(r):
+    return 1.0 if (r['b'][0] - r['a'][0]) > 0 else -1.0
+
+
+def ms_for(units, side, foot_y, cfg):
+    """按压时间 = k × 距离 + b（+ 左右方向修正 + 小人高度修正，自动校准学到才有）。回传整数 ms。"""
+    ms = (units * cfg['k'] + cfg['b'] + cfg.get('k_side', 0) * side
+          + cfg.get('k_foot', 0) * (foot_y - cfg.get('foot0', foot_y)))
+    return int(round(max(cfg.get('min_ms', 150), min(cfg.get('max_ms', 2500), ms))))
+
+
+def _robust_lstsq(X, y, min_keep):
+    keep = np.ones(len(y), bool)
+    w = None
     for _ in range(2):                                   # 去掉离群的（例如量错的那几跳）再算一次
-        A = np.vstack([x[keep], np.ones(keep.sum())]).T
-        (k, b), *_ = np.linalg.lstsq(A, y[keep], rcond=None)
-        res = np.abs(x * k + b - y)
+        w, *_ = np.linalg.lstsq(X[keep], y[keep], rcond=None)
+        res = np.abs(X @ w - y)
         mad = np.median(res[keep]) + 1e-6
         keep = res <= max(3 * mad, 15)
-        if keep.sum() < MIN_LAND:
-            return None
-    rms = float(np.sqrt(((x[keep] * k + b - y[keep]) ** 2).mean()))
-    if k <= 0:
+        if keep.sum() < min_keep:
+            return None, None
+    return w, keep
+
+
+def fit_land(store, n=80):
+    """用量到的落点拟合：按了 ms → 实际跳了 traveled。
+    基本：ms = k × traveled + b。资料够多时，再试「左右方向修正」和「小人高度修正」，
+    用一半资料学、另一半测（两种分法都做），真的比较准才采用，避免学到杂讯。"""
+    rs = [r for r in store.recs if r.get('land')][-n:]
+    if len(rs) < MIN_LAND:
         return None
-    return {'k': float(k), 'b': float(b), 'rms': rms, 'n': int(keep.sum())}
+    x = np.array([r['land']['traveled'] for r in rs], float)
+    y = np.array([r['ms'] for r in rs], float)
+    if x.max() - x.min() < 80:
+        return None
+    side = np.array([_jump_side(r) for r in rs])
+    fy = np.array([r['a'][1] for r in rs], float)
+    f0 = float(np.median(fy))
+    cols = {'base': [x, np.ones_like(x)]}
+    if len(rs) >= 30 and (side > 0).sum() >= 8 and (side < 0).sum() >= 8:
+        cols['side'] = cols['base'] + [side]
+        if len(rs) >= 40:
+            cols['side+foot'] = cols['side'] + [fy - f0]
+
+    def cv_rms(c):
+        X = np.vstack(c).T
+        idx = np.arange(len(y))
+        errs = []
+        for part in (idx % 2 == 0, idx % 2 == 1):
+            w, _ = _robust_lstsq(X[~part], y[~part], len(c) + 2)
+            if w is None:
+                return 1e9
+            r = X[part] @ w - y[part]
+            errs.append(np.abs(r))
+        e = np.concatenate(errs)
+        e = e[e <= max(3 * np.median(e), 15)]           # 测试时也不算明显量错的
+        return float(np.sqrt((e ** 2).mean()))
+
+    best, best_cv = 'base', cv_rms(cols['base'])
+    for name in ('side', 'side+foot'):
+        if name in cols:
+            cv = cv_rms(cols[name])
+            if cv < best_cv * 0.95:                      # 至少准 5% 才值得多学一项
+                best, best_cv = name, cv
+    X = np.vstack(cols[best]).T
+    w, keep = _robust_lstsq(X, y, MIN_LAND)
+    if w is None or w[0] <= 0:
+        return None
+    rms = float(np.sqrt(((X[keep] @ w - y[keep]) ** 2).mean()))
+    return {'k': float(w[0]), 'b': float(w[1]), 'k_side': float(w[2]) if len(w) > 2 else 0.0,
+            'k_foot': float(w[3]) if len(w) > 3 else 0.0, 'foot0': f0, 'terms': best,
+            'rms': rms, 'cv': best_cv, 'n': int(keep.sum())}
 
 
 def land_stats(store, n=10):
@@ -713,7 +841,7 @@ def export(store, cfg, extra_info=None):
     # 每一跳一行，Excel 可以直接打开（utf-8-sig 让 Excel 认得中文）
     rows = [['#', 'id', '时间', '谁', '距离', '按压ms', '当时k', '当时b', 'AI预测距离', 'AI小人信心',
              '落点偏差', '落点偏差%', '实际跳的距离', '结果(-1太久 0刚好 1太短)', '按下时间', 'ESP回报按完时间',
-             '故意偏离']]
+             '故意偏离', '按之前的分数', '故意结束']]
     for i, r in enumerate(recs, 1):
         land = r.get('land') or {}
         units = (land.get('traveled', 0) - land.get('err', 0)) if land else 0
@@ -722,7 +850,8 @@ def export(store, cfg, extra_info=None):
         rows.append([i, r['id'], r['id'][:15], 'AI' if r.get('auto') else '你', r['units'], r['ms'],
                      r.get('k_used', ''), r.get('b_used', ''), pred.get('units', ''), pred.get('score', ''),
                      land.get('err', ''), pct, land.get('traveled', ''), '' if r.get('r') is None else r['r'],
-                     r.get('t_press', ''), r.get('t_done', ''), r.get('aim', '')])
+                     r.get('t_press', ''), r.get('t_done', ''), r.get('aim', ''), r.get('score', ''),
+                     'Y' if r.get('end_game') else ''])
     lc = land_count(store)
     sh = shadow_stats(store)
     ls = land_stats(store)
@@ -733,7 +862,8 @@ def export(store, cfg, extra_info=None):
         f'量到落点：{lc} 跳' + (f'，最近 {ls["n"]} 跳平均偏 {ls["mean"] * 100:.2f}%' if ls else ''),
         f'AI vs 你：' + (f'最近 {sh["n"]} 跳中位误差 {sh["med"] * 100:.2f}%' if sh.get('n') else '没有资料'),
         f'目前 k = {cfg.get("k")}, b = {cfg.get("b")}, 跳跃角度 {cfg.get("jump_angle_deg")}°, 投影 {cfg.get("gui_proj")}',
-        '落点拟合：' + (f'k = {fl["k"]:.4f}, b = {fl["b"]:.1f}（{fl["n"]} 跳，±{fl["rms"]:.1f} ms）' if fl else '资料不够'),
+        '落点拟合：' + (f'k = {fl["k"]:.4f}, b = {fl["b"]:.1f}, 左右修正 {fl["k_side"]:+.1f} ms, 高度修正 {fl["k_foot"]:+.1f}'
+                       f'（{fl["terms"]}，{fl["n"]} 跳，±{fl["rms"]:.1f} ms，另一半资料测 ±{fl["cv"]:.1f} ms）' if fl else '资料不够'),
         f'学到的跳跃角度：{learned_angle(store)}',
         f'电脑：{platform.platform()}，Python {platform.python_version()}',
     ] + [f'{k}：{v}' for k, v in (extra_info or {}).items()]
@@ -753,3 +883,55 @@ def export(store, cfg, extra_info=None):
                 if os.path.exists(f):
                     z.write(f, 'shots/' + r['id'] + suffix, compress_type=zipfile.ZIP_STORED)
     return path
+
+
+# ================================================================ 读分数（画面上方的白色大数字）
+_DIGITS = None
+
+
+def _digit_templates():
+    global _DIGITS
+    if _DIGITS is None:
+        try:
+            with open(os.path.join(HERE, 'digits.json'), encoding='utf-8') as f:
+                raw = json.load(f)
+            _DIGITS = [(ch, np.array([[c == '#' for c in row] for row in t], float))
+                       for ch, ts in raw.items() for t in ts]
+        except Exception:  # noqa: BLE001
+            _DIGITS = []
+    return _DIGITS
+
+
+def read_score(im):
+    """读画面上方的分数（白色大数字）。读不到回传 None。数字样板来自你的截图（pc/digits.json）。"""
+    T = _digit_templates()
+    if not T:
+        return None
+    W0 = 540
+    a = as_arr(im, W0)
+    H = a.shape[0]
+    y0, y1 = int(0.105 * H), int(0.215 * H)
+    x0, x1 = int(0.18 * W0), int(0.90 * W0)
+    m = a[y0:y1, x0:x1].min(2) > 235                      # 纯白的像素
+    lab, sizes = _label(m)
+    glyphs = []
+    for L in range(1, len(sizes)):
+        ys, xs = np.nonzero(lab == L)
+        h, w = ys.max() - ys.min() + 1, xs.max() - xs.min() + 1
+        if 0.10 * W0 <= h <= 0.145 * W0 and w <= 0.11 * W0:   # 大数字的高度；排除标签上的小白字
+            glyphs.append((xs.min(), ys.min(), h, w, (lab == L)[ys.min():ys.max() + 1, xs.min():xs.max() + 1]))
+    if not glyphs or len(glyphs) > 6:
+        return None
+    glyphs.sort(key=lambda g: g[0])
+    hmax = max(g[2] for g in glyphs)
+    if any(g[2] < 0.85 * hmax for g in glyphs):
+        return None
+    out = ''
+    for _, _, _, _, g in glyphs:
+        gi = np.asarray(Image.fromarray((g * 255).astype(np.uint8)).resize((16, 24), Image.BILINEAR)) > 127
+        d = [(((gi - t) ** 2).mean(), ch) for ch, t in T]
+        d.sort()
+        if d[0][0] > 0.12:                                   # 不像任何数字
+            return None
+        out += d[0][1]
+    return int(out)

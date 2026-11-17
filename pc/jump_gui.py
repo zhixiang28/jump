@@ -62,13 +62,16 @@ class App:
         self.grabbing = False
         self.store = learn.Store()
         self.tpls = learn.build_templates(self.store)
+        self.mem = learn.build_target_memory(self.store)   # 目标记忆：AI 不会、你画给它看的方块
         self.pred = None           # AI 对目前画面的预测
         self.cur_rec = None        # 上一次按压的学习纪录（等你按 1/2/3）
         self.auto_fail = 0
         self.pending = None        # 刚按完、等着量落点的那一跳 (jump, rec)
+        self.score = None          # 画面上读到的分数
         self.cfg.setdefault('auto_calib', True)
         self.cfg.setdefault('miss_pct', 10)        # AI 自动玩时，故意不跳正中的机率（%）
         self.cfg.setdefault('miss_amount', 0.6)    # 故意偏离最多到「中心→边缘」距离的几成
+        self.cfg.setdefault('target_score', 0)     # 目标分数：AI 自动玩到这个分数就故意失误结束（0 = 不限）
         self.build()
         self.root.after(50, self.poll)
         self.root.after(100, self.start)
@@ -229,6 +232,7 @@ class App:
         self.e_wait = entry('按完等几秒', 'wait_after')
         self.e_miss = entry('故意偏离机率 %', 'miss_pct')
         self.e_miss_amt = entry('偏离幅度 0~0.7', 'miss_amount')
+        self.e_target = entry('目标分数（0=不限）', 'target_score')
         tk.Label(c, text='AI 自动玩时，大约这个比例的跳会故意不跳正中（只往跳跃方向偏远或偏近，\n'
                          '最多偏到中心→边缘距离的这几成，一定还在平台上）。小平台（宽 < 屏宽 25%）一律瞄正中。',
                  font=('Microsoft YaHei UI', 9), bg=CARD, fg=SUB, justify='left').pack(anchor='w')
@@ -498,8 +502,8 @@ class App:
                 dot, ux, uy, name = best
                 self.units = abs(dot) * 1000 / W
                 self.proj_end = (ax + ux * dot, ay + uy * dot, name)
-            ms = self.units * self.cfg['k'] + self.cfg['b']
-            self.ms = int(round(max(self.cfg['min_ms'], min(self.cfg['max_ms'], ms))))
+            side = 1.0 if bx > ax else -1.0
+            self.ms = learn.ms_for(self.units, side, ay / W, self.cfg)
         if self.units:
             self.ms_lbl.config(text=f'{self.ms} ms')
             if self.proj_end:
@@ -522,7 +526,8 @@ class App:
             c.create_line(*F, *C, fill='#e9a0ff', width=3, dash=(6, 4), tags='ov')
             for (x, y) in (F, C):
                 c.create_oval(x - 6, y - 6, x + 6, y + 6, outline='#e9a0ff', width=3, tags='ov')
-            c.create_text(C[0], C[1] - 18, text=f'AI {p["ms"]} ms', fill='#e9a0ff',
+            c.create_text(C[0], C[1] - 18, text=f'AI{"（记忆）" if p.get("method") == "memory" else ""} {p["ms"]} ms',
+                          fill='#e9a0ff',
                           font=('Microsoft YaHei UI', 11, 'bold'), tags='ov')
         if not self.line:
             return
@@ -571,12 +576,16 @@ class App:
                                           extra=self.press_extra())
             self.pending = (self.make_jump(self.line['a'], self.line['b'], self.units), self.cur_rec)
             self.tpls = learn.build_templates(self.store)     # 学新的小人样子
+            n_mem = len(self.mem)
+            self.mem = learn.build_target_memory(self.store)  # AI 不会的方块记下来
+            if len(self.mem) > n_mem:
+                self.store.event('memory_add', n=len(self.mem))
             self.update_learn()
 
     def press_extra(self):
         """每一跳额外记下来的东西（导出后用来重新校准）。"""
         return {'k_used': self.cfg['k'], 'b_used': self.cfg['b'], 't_press': round(time.time(), 3),
-                'proj': bool(self.cfg.get('gui_proj')), 'angle': self.cfg.get('jump_angle_deg')}
+                'proj': bool(self.cfg.get('gui_proj')), 'angle': self.cfg.get('jump_angle_deg'), 'score': self.score}
 
     def make_jump(self, a, b, units):
         """这一跳原本要跳的方向和距离。AI 有量到目标、而且跟你画的终点差不多时，用 AI 量的（比较精确）。"""
@@ -646,24 +655,25 @@ class App:
     def predict_async(self):
         if not self.img or not self.tpls:
             self.update_learn(); return
-        img, tpls = self.img, self.tpls
+        img, tpls, mem = self.img, self.tpls, self.mem
         pend, self.pending = self.pending, None
 
         def work():
             ch = learn.find_char(img, tpls)            # 小人只找一次，量落点和预测共用
             land = learn.landing(img, tpls, pend[0], ch=ch) if pend else None
-            return learn.predict(img, tpls, self.cfg, self.store, ch=ch), land
+            return learn.predict(img, tpls, self.cfg, self.store, ch=ch, mem=mem), land, learn.read_score(img)
         self.bg(work, lambda res, err: self.after_pred(img, res, err, pend))
 
     def after_pred(self, img, res, err, pend=None):
-        p, land = res if res else ({'err': str(err)}, None)
+        p, land, score = res if res else ({'err': str(err)}, None, None)
+        if score is not None and img is self.img:
+            self.score = score                       # 读不到（例如通知挡住）就沿用上一次的
         if pend:
             self.handle_landing(land, pend, img)
         if img is not self.img:
             return                                   # 画面已经换了
         if 'units' in p:                             # k/b 可能刚被校准过：用最新的重算 ms
-            ms = p['units'] * self.cfg['k'] + self.cfg['b']
-            p['ms'] = int(round(max(self.cfg['min_ms'], min(self.cfg['max_ms'], ms))))
+            p['ms'] = learn.ms_for(p['units'], p['side'], p['foot'][1], self.cfg)
         self.pred = p
         self.draw(); self.update_learn()
         if self.v_play.get():
@@ -676,7 +686,10 @@ class App:
         if land is None:
             self.status('量不到这一跳的落点（这块没有奶油色顶面），可以按 1/2/3 告诉我结果', 'warn'); return
         if land.get('lost'):
-            self.status('⚠ 跳完找不到小人：可能掉下去了（游戏结束？）', 'err')
+            if rec.get('end_game'):
+                self.status(f'🏁 目标分数达成，这一局已结束（最后分数 {rec.get("score")}）', 'ok')
+            else:
+                self.status('⚠ 跳完找不到小人：可能掉下去了（游戏结束？）', 'err')
             if self.v_play.get():
                 self.v_play.set(False)
             return
@@ -701,32 +714,43 @@ class App:
 
     def calibrate(self, rec, jump):
         f = learn.fit_land(self.store)
+        extra = {}
         if f and f['rms'] < 30:
             k, b = round(f['k'], 4), round(f['b'])
-            how = f'（{f["n"]} 跳拟合，误差 ±{f["rms"]:.0f} ms）'
+            extra = {'k_side': round(f['k_side'], 1), 'k_foot': round(f['k_foot'], 1), 'foot0': round(f['foot0'], 4)}
+            terms = {'base': '', 'side': ' + 左右修正', 'side+foot': ' + 左右修正 + 高度修正'}[f['terms']]
+            how = f'（{f["n"]} 跳拟合{terms}，误差 ±{f["rms"]:.0f} ms）'
         else:
             # 资料还不够：用这一跳单独修 k（只修一部分，避免一次量错就乱掉）
             traveled = rec['land']['traveled']
             if traveled < 50:
                 return ''
-            k_true = (rec['ms'] - self.cfg['b']) / traveled
+            corr = (self.cfg.get('k_side', 0) * learn._jump_side(rec)
+                    + self.cfg.get('k_foot', 0) * (rec['a'][1] - self.cfg.get('foot0', rec['a'][1])))
+            k_true = (rec['ms'] - self.cfg['b'] - corr) / traveled
             k = round(max(0.01, self.cfg['k'] + 0.6 * (k_true - self.cfg['k'])), 4)
             b = self.cfg['b']
             how = '（单跳修正）'
-        if k == self.cfg['k'] and b == self.cfg['b']:
+        if k == self.cfg['k'] and b == self.cfg['b'] and all(self.cfg.get(x) == v for x, v in extra.items()):
             return ''
-        self.store.event('calibrate', k_old=self.cfg['k'], b_old=self.cfg['b'], k=k, b=b, how=how)
+        self.store.event('calibrate', k_old=self.cfg['k'], b_old=self.cfg['b'], k=k, b=b, how=how, **extra)
         self.cfg['k'], self.cfg['b'] = k, b
+        self.cfg.update(extra)
         jb.save_config(self.cfg)
         for e, key in ((self.e_k, 'k'), (self.e_b, 'b')):
             e.delete(0, 'end'); e.insert(0, str(self.cfg[key]))
         self.recalc()
-        return f' → k = {k}, b = {b}{how}'
+        side_txt = f'，右上 {self.cfg["k_side"]:+.0f} ms' if self.cfg.get('k_side') else ''
+        return f' → k = {k}, b = {b}{side_txt}{how}'
 
     def update_learn(self):
         recs = self.store.recs
         mine = sum(1 for r in recs if not r.get('auto'))
-        lines = [f'已记录 {len(recs)} 跳（你画的 {mine}）· 小人模板 {len(self.tpls) // 2} 个']
+        lines = [f'已记录 {len(recs)} 跳（你画的 {mine}）· 小人模板 {len(self.tpls) // 2} 个 · 目标记忆 {len(self.mem)} 种']
+        tgt = int(self.cfg.get('target_score') or 0)
+        if self.score is not None or tgt:
+            lines.append(f'目前分数：{self.score if self.score is not None else "?"}'
+                         + (f' / 目标 {tgt}' if tgt else ''))
         ang = learn.learned_angle(self.store)
         if ang:
             lines.append(f'学到的跳跃角度：{ang:.1f}°')
@@ -793,7 +817,7 @@ class App:
     def clear_learn(self):
         if not messagebox.askyesno('清除学习', '清除所有学习纪录和截图？（k、b 不会变）'):
             return
-        self.store.clear(); self.tpls = []; self.pred = None
+        self.store.clear(); self.tpls = []; self.mem = []; self.pred = None
         self.draw(); self.update_learn(); self.status('学习纪录已清除', 'ok')
 
     def toggle_play_btn(self):
@@ -843,22 +867,33 @@ class App:
         W = self.img.size[0]
         a = (p['foot'][0] * W, p['foot'][1] * W)
         b = (p['center'][0] * W, p['center'][1] * W)
-        aim = self.pick_aim(p)
-        ms = p['ms']
-        if aim:
-            ms = int(round(max(self.cfg['min_ms'], min(self.cfg['max_ms'],
-                                                       (p['units'] + aim) * self.cfg['k'] + self.cfg['b']))))
+        target = int(self.cfg.get('target_score') or 0)
+        ending = target > 0 and self.score is not None and self.score >= target
+        if ending:
+            # 到目标分数了：故意跳过头（跳过目标方块的远边再往外），结束这一局
+            w = p.get('width') or 0.35
+            aim = 0.29 * w * 1000 + 160
+        elif target > 0 and self.score is not None and 0 < target - self.score <= 12:
+            aim = self.pick_aim(p, force=True)       # 快到了：大平台故意不跳正中，只拿 +1，不要一下子超过太多
+        else:
+            aim = self.pick_aim(p)
+        ms = learn.ms_for(p['units'] + aim, p['side'], p['foot'][1], self.cfg)
         if self.press(ms):
-            if aim:
+            if ending:
+                self.status(f'🏁 已到目标分数 {target}（现在 {self.score}）：故意失误，结束这一局', 'ok')
+                self.store.event('end_game', score=self.score, target=target)
+            elif aim:
                 self.status(f'🤖 这跳故意不跳正中：{"偏远" if aim > 0 else "偏近"} {abs(aim):.0f}（{ms} ms）', 'ok')
             self.last = {'ms': ms, 'units': p['units'] + aim}
             extra = self.press_extra()
             extra['aim'] = round(aim, 1)
+            if ending:
+                extra['end_game'] = True
             self.cur_rec = self.store.add(self.img, a, b, p['units'], ms, pred=p, auto=True, extra=extra)
             self.pending = (self.make_jump(a, b, p['units']), self.cur_rec)
             self.update_learn()
 
-    def pick_aim(self, p):
+    def pick_aim(self, p, force=False):
         """要不要故意不跳正中：回传沿跳跃方向偏多少（+ 偏远 / − 偏近，屏宽 = 1000），0 = 瞄正中。
         顶面中心到边缘（沿跳跃方向）大约是顶面宽度的 0.29 倍；最多偏到这段的 miss_amount 成，
         再留一点按压误差的余地，保证还在平台上。小平台一律瞄正中。"""
@@ -868,6 +903,8 @@ class App:
         except (TypeError, ValueError):
             return 0.0
         w = p.get('width') or 0
+        if force:
+            pct, amt = 100.0, max(amt, 0.5)
         if pct <= 0 or amt <= 0 or w < 0.25 or random.random() * 100 >= pct:
             return 0.0
         edge = 0.29 * w * 1000                         # 中心 → 边缘
