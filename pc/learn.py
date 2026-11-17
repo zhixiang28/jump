@@ -239,7 +239,7 @@ def _label(m):
 
 
 def find_target(im, foot, angle_deg=30, diff_thr=45):
-    """foot：屏宽比例。回传 {'center': (x, y) 屏宽比例, 'top', 'side'} 或 None。"""
+    """foot：屏宽比例。回传 {'center': (x, y) 屏宽比例, 'top', 'side', 'width'} 或 None。"""
     Wn = NW // 2
     img = as_arr(im, Wn)
     Hn = img.shape[0]
@@ -259,15 +259,70 @@ def find_target(im, foot, angle_deg=30, diff_thr=45):
     m = _open(m)
     lab, sizes = _label(m)
 
-    # 沿跳跃线往外走：先经过小人（挖掉的区域）和脚下的方块，
-    # 看到一段真正的背景之后，碰到的第一个物体就是目标。
-    # （两个方块在画面上常常连在一起，所以不能用「连通区块」来区分。）
+    # 小人脚下那个方块（包括它上面的装饰，例如椰子树）
+    cur = set()
+    for dy in (0.01, 0.03, 0.05):
+        yy = int(fy + dy * Wn) - y0
+        if 0 <= yy < lab.shape[0]:
+            for dx in (-0.04, 0, 0.04):
+                xx = int(fx + dx * Wn)
+                if 0 <= xx < Wn and lab[yy, xx]:
+                    cur.add(int(lab[yy, xx]))
+
     t = math.radians(angle_deg)
     min_size = 0.002 * Wn * Wn
+
+    def face_center(L, side):
+        """量这个物体的顶面：回传 (cx, cy, 顶点y, 顶面宽) 或 None。"""
+        ys, xs = np.nonzero(lab == L)
+        keep = (xs - fx) * side > 0.1 * Wn                      # 只看目标那一侧（可能跟脚下方块连在一起）
+        ys, xs = ys[keep], xs[keep]
+        if not len(ys):
+            return None
+        top = int(ys.min())
+        tx = float(xs[ys <= top + 1].mean())
+        # 从顶点往下，每一列取包含中心那一段的宽度。菱形 / 椭圆顶面越往下越宽，
+        # 到顶面中心那一列之后就是侧面，宽度不再增加 → 第一个「宽度停止增加」的列就是中心高度。
+        comp = lab == L
+        xc = int(round(tx))
+        widths = []
+        for k in range(0, int(0.3 * Wn)):
+            y = top + k
+            if y >= comp.shape[0]:
+                break
+            row = comp[y]
+            if not (0 <= xc < Wn) or not row[xc]:
+                hits = np.nonzero(row[max(0, xc - 3):xc + 4])[0]
+                if not len(hits):
+                    break
+                xc = max(0, xc - 3) + int(hits[len(hits) // 2])
+            l = xc
+            while l > 0 and row[l - 1]:
+                l -= 1
+            r = xc
+            while r < Wn - 1 and row[r + 1]:
+                r += 1
+            widths.append(r - l + 1)
+        kc = None
+        for k in range(2, len(widths) - 4):
+            if widths[k + 4] - widths[k] <= 2:
+                kc = k
+                break
+        if kc is None:
+            return None
+        w = widths[kc]
+        if w < 0.22 * Wn:                                      # 太窄：是装饰（椰子树、雪花…），不是方块（方块约 0.3~0.5 屏宽）
+            return None
+        return tx, top + kc, top, w
+
+    # 沿跳跃线往外走：先经过小人（挖掉的区域）和脚下的方块，看到一段真正的背景之后，
+    # 碰到的第一个「像方块」的物体就是目标。太窄的（装饰）跳过继续找。
+    # （两个方块在画面上常常连在一起，所以不能只靠「连通区块」来区分。）
     found = []
     for side in (1, -1):
         ux, uy = side * math.cos(t), -math.sin(t)
         gap = 0
+        skip = set()
         for s in range(2, int(1.2 * Wn)):
             x, y = int(round(fx + ux * s)), int(round(fy + uy * s)) - y0
             if not (0 <= x < Wn and 0 <= y < lab.shape[0]):
@@ -275,27 +330,24 @@ def find_target(im, foot, angle_deg=30, diff_thr=45):
             if excl[y, x]:
                 continue
             L = int(lab[y, x])
-            if not L:
+            if not L or L in skip:
                 gap += 1
-            elif gap >= 2 and sizes[L] >= min_size:
-                found.append((s, side, L))
-                break
+                continue
+            if gap >= 2 and sizes[L] >= min_size and (L not in cur or s >= 0.25 * Wn):
+                fc = face_center(L, side)
+                if fc:
+                    found.append((L in cur, s, side, fc))
+                    break
+                skip.add(L)
+                gap = 0
     if not found:
         return None
-    s, side, L = min(found)
-    ys, xs = np.nonzero(lab == L)
-    keep = (xs - fx) * side > 0.1 * Wn                          # 只看目标那一侧（可能跟脚下方块连在一起）
-    ys, xs = ys[keep], xs[keep]
-    if not len(ys):
+    # 优先选「没有跟脚下方块连在一起」的那一个，再选比较近的
+    _, s, side, (cx, cyl, top, w) = min(found, key=lambda f: (f[0], f[1]))
+    ty, cy = top + y0, cyl + y0
+    if not (ty < cy < ty + 0.4 * Wn) or (cx - fx) * side <= 0 or cy > fy:
         return None
-    top = ys.min()
-    tx = float(xs[ys <= top + 1].mean())
-    ty = top + y0
-    cx = tx
-    cy = fy - abs(cx - fx) * math.tan(t)
-    if not (ty < cy < ty + 0.4 * Wn) or (cx - fx) * side <= 0:
-        return None
-    return {'center': (cx / Wn, cy / Wn), 'top': (tx / Wn, ty / Wn), 'side': side}
+    return {'center': (cx / Wn, cy / Wn), 'top': (cx / Wn, ty / Wn), 'side': side, 'width': w / Wn}
 
 
 # ================================================================ 预测 / 统计
@@ -339,7 +391,11 @@ def predict(im, tpls, cfg, store, char_thr=0.55):
         return {'err': '找不到目标方块', 'foot': ch['foot'], 'score': ch['score']}
     fx, fy = ch['foot']
     cx, cy = tg['center']
-    raw_units = math.hypot(cx - fx, cy - fy) * 1000
+    dx, dy = cx - fx, cy - fy
+    raw_units = math.hypot(dx, dy) * 1000
+    if cfg.get('gui_proj', True):                 # 跟画线时的算法一样：投影到比较接近的跳跃方向
+        t = math.radians(cfg.get('jump_angle_deg', 30))
+        raw_units = max(abs(dx * math.cos(t) - dy * math.sin(t)), abs(-dx * math.cos(t) - dy * math.sin(t))) * 1000
     st = shadow_stats(store)
     corr = st['ratio'] if st['n'] >= 5 else 1.0              # 依你的画线习惯修正比例
     units = raw_units * corr

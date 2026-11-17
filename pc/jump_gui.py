@@ -20,6 +20,7 @@ import time
 import tkinter as tk
 from tkinter import messagebox
 
+import numpy as np
 from PIL import Image, ImageTk
 
 import jump_bot as jb
@@ -58,6 +59,7 @@ class App:
         self.tpls = learn.build_templates(self.store)
         self.pred = None           # AI 对目前画面的预测
         self.cur_rec = None        # 上一次按压的学习纪录（等你按 1/2/3）
+        self.auto_fail = 0
         self.build()
         self.root.after(50, self.poll)
         self.root.after(100, self.start)
@@ -224,7 +226,24 @@ class App:
             self.status(str(err or err_msg), 'err'); return
         self.refresh()
 
-    def refresh(self):
+    def grab_stable(self, tries=8):
+        """等画面停下来（镜头还在移动时，跳跃方向会是歪的）：连拍两张差不多才算。"""
+        def small(im):
+            return np.asarray(im.convert('L').resize((60, 132)), dtype=np.float32)
+        a = jb.screenshot(self.adb)
+        for _ in range(tries):
+            time.sleep(0.35)
+            b = jb.screenshot(self.adb)
+            if float(np.abs(small(a) - small(b)).mean()) < 3.0:   # 雪花在飘只会差一点点
+                return b
+            a = b
+        return a
+
+    def refresh(self, stable=False):
+        if stable and self.adb and not self.grabbing:
+            self.grabbing = True
+            self.bg(self.grab_stable, self.after_shot)
+            return
         if not self.adb or self.grabbing:
             return
         self.grabbing = True
@@ -401,7 +420,7 @@ class App:
 
         def done():
             self.busy = False; self.press_btn.config(state='normal')
-            self.line = None; self.recalc(); self.refresh()   # 新画面、清掉旧线
+            self.line = None; self.recalc(); self.refresh(stable=self.v_play.get())   # 新画面、清掉旧线
         self.root.after(int(self.cfg['wait_after'] * 1000), done)
 
     # ------------------------------------------------------------ 校准
@@ -501,6 +520,7 @@ class App:
                 f'（建议 ≥{learn.MIN_SHADOW} 跳、≤{learn.GOOD_ERR * 100:.0f}%）\n\n还是要让它自己玩吗？'):
             self.v_play.set(False); return
         self.status('🤖 AI 自动玩中（Esc 停止）', 'ok')
+        self.auto_fail = 0
         self.auto_step()
 
     def auto_step(self):
@@ -510,9 +530,15 @@ class App:
         if p is None:
             return                                   # 还在预测，等 after_pred 再叫
         if 'ms' not in p:
+            if self.auto_fail < 2:                   # 可能刚好在动画中：等一下再看一次
+                self.auto_fail += 1
+                self.status(f'AI 看不懂这张（{p.get("err")}），再看一次…', 'warn')
+                self.root.after(700, lambda: self.refresh(stable=True))
+                return
             self.v_play.set(False)
             self.status(f'⏸ AI 停下来了：{p.get("err", "看不懂这个画面")}。请手动画这一跳', 'warn')
             return
+        self.auto_fail = 0
         W = self.img.size[0]
         a = (p['foot'][0] * W, p['foot'][1] * W)
         b = (p['center'][0] * W, p['center'][1] * W)
