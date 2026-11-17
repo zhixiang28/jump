@@ -636,6 +636,8 @@ class App:
     def feedback(self, d):
         if not self.last:
             self.status('先画线按一次，再告诉我跳太远还是跳太近', 'warn'); return
+        if self.v_calib.get():
+            return self.user_result(d)
         if self.last_dir and d != self.last_dir:
             self.cfg['step'] = max(0.005, self.cfg['step'] / 2)
         self.last_dir = d
@@ -650,6 +652,8 @@ class App:
         self.show_info(); self.recalc()
 
     def ok(self):
+        if self.v_calib.get() and self.last:
+            return self.user_result(0)
         if self.last:
             self.store.set_result(self.cur_rec, 0, self.last['ms']); self.update_learn()
             self.store.event('feedback', id=self.cur_rec and self.cur_rec['id'], result=0)
@@ -657,6 +661,39 @@ class App:
         jb.save_config(self.cfg); self.show_info()
         self.status(f'👍 调整幅度收窄为 ±{self.cfg["step"] * 100:.1f}%', 'ok')
 
+
+    def user_result(self, d):
+        """开着自动校准时，「跳太远 / 刚好 / 跳太近」不直接改 k，而是告诉程序这一跳的结果，
+        交给同一套校准处理（不然两边会互相打架）。同一跳按几次都只算一次。
+        d：-1 跳太远、0 刚好、+1 跳太近。"""
+        rec = self.cur_rec
+        if rec is None:
+            return
+        units = rec['units'] or 1.0
+        names = {-1: '跳太远', 0: '刚好', 1: '跳太近'}
+        L = rec.get('land')
+        if L and not L.get('fell') and not L.get('user'):
+            pct = (L['err'] - (rec.get('aim') or 0)) / units
+            # 量到的落点跟你说的差不多：用量到的（比较精确）；明显矛盾才相信你（可能量错了）
+            conflict = (d == -1 and pct < -0.04) or (d == 1 and pct > 0.04) or (d == 0 and abs(pct) > 0.08)
+            if not conflict:
+                rec['r'] = d
+                self.store.save()
+                self.store.event('feedback', id=rec['id'], result=d, used='measured')
+                self.status(f'已记下：{names[d]}。量到的落点是 {pct * 100:+.1f}%，差不多，以量到的为准（自动校准已经处理）', 'ok')
+                self.update_learn()
+                return
+        # 没量到、掉下去了、或跟量到的矛盾 → 用你说的结果（跳太远 ≈ 远了 6%）
+        traveled = units * (1 - 0.06 * d) + (rec.get('aim') or 0)
+        first = not (L and L.get('user'))
+        rec['land'] = {'err': round(traveled - units, 1), 'traveled': round(traveled, 1), 'user': True}
+        rec['r'] = d
+        self.store.save()
+        self.store.event('feedback', id=rec['id'], result=d, used='user')
+        msg = f'已记下：{names[d]}'
+        if first:                                    # 同一跳按很多次只校准一次
+            msg += self.calibrate(rec, None)
+        self.status(msg, 'ok'); self.update_learn()
 
     # ------------------------------------------------------------ 学习 / AI
     def predict_async(self):
@@ -786,7 +823,8 @@ class App:
         else:
             lines.append(f'有结果的 {f["n"]} 笔（按 1/2/3），满 8 笔就能拟合 k/b')
         self.learn_lbl.config(text='\n'.join(lines))
-        self.fit_btn.config(state='normal' if self.fit else 'disabled')
+        # 开着自动校准时停用：这个拟合是用 1/2/3 的粗略结果算的，会跟自动校准打架
+        self.fit_btn.config(state='normal' if self.fit and not self.v_calib.get() else 'disabled')
         self.draw_chart()
         self.update_history()
 

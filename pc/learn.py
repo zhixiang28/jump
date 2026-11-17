@@ -455,7 +455,11 @@ def landing(im, tpls, jump, ch=None):
     err = dx * ux + dy * uy
     if abs(err) > face['width'] * 1000 * 0.7:           # 偏太多：可能不是站在这块上，不采用
         return None
-    return {'err': err, 'traveled': jump['units'] + err,
+    # 偏超过顶面一半：多半是掉下去了（小人倒在边上）。方向是对的，但量到的距离不可靠 → 只算到上限
+    cap = face['width'] * 1000 * 0.45
+    fell = abs(err) > cap
+    used = max(-cap, min(cap, err))
+    return {'err': used, 'raw_err': err, 'fell': fell, 'traveled': jump['units'] + used,
             'foot': [round(v, 4) for v in ch['foot']], 'face': [round(v, 4) for v in face['center']],
             'score': round(ch['score'], 3)}
 
@@ -838,7 +842,7 @@ def calibration_update(store, cfg, rec):
     """跳完量到落点后，算新的 k、b（含合理范围和每次最多变多少）。回传 (新参数 dict, 说明) 或 (None, '')。"""
     f = fit_land(store, cfg=cfg)
     fresh = len(_land_recs(store, cfg, 999)) < 15           # 刚重新校准：允许变化大一点
-    if f and f['rms'] < 30:
+    if f and f['rms'] < (60 if fresh else 30):           # 刚重新校准时资料比较乱，也先用（下面有每次变动上限）
         new = {'k': f['k'], 'b': f['b'], 'k_side': f['k_side'], 'k_foot': f['k_foot'], 'foot0': f['foot0']}
         terms = {'base': '', 'side': ' + 左右修正', 'side+foot': ' + 左右修正 + 高度修正',
                  'k-only': '（只调 k）'}[f['terms']]
@@ -848,12 +852,13 @@ def calibration_update(store, cfg, rec):
         if traveled < 50:
             return None, ''
         corr = (cfg.get('k_side', 0) * _jump_side(rec) + cfg.get('k_foot', 0) * (rec['a'][1] - cfg.get('foot0', rec['a'][1])))
-        if fresh:
+        miss = rec['ms'] - (cfg['k'] * traveled + cfg['b'] + corr)       # 这跳多按（+）或少按（−）了几 ms
+        b_try = cfg['b'] + 0.7 * miss
+        if fresh and B_RANGE[0] <= b_try <= B_RANGE[1]:
             # 刚调整过装置：主要变的是触控笔的行程时间（b），先修 b，资料够了再一起拟合 k
-            miss = rec['ms'] - (cfg['k'] * traveled + cfg['b'] + corr)   # 这跳多按（+）或少按（−）了几 ms
-            new = {'k': cfg['k'], 'b': cfg['b'] + 0.7 * miss}
+            new = {'k': cfg['k'], 'b': b_try}
             how = '（单跳修正 b）'
-        else:
+        else:                                            # b 已经到上下限（或资料够多了）：改修 k
             k_true = (rec['ms'] - cfg['b'] - corr) / traveled
             new = {'k': cfg['k'] + 0.6 * (k_true - cfg['k'])}
             how = '（单跳修正）'
