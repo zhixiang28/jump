@@ -208,6 +208,30 @@ def save_debug(im, px, py, bx, by, dist, ms, note=''):
         print('debug 图存不了：', e)
 
 
+def save_fail(im):
+    """判断失败时存原始截图，方便检查（debug/fail.png）。"""
+    if im is None:
+        return
+    try:
+        os.makedirs(DEBUG_DIR, exist_ok=True)
+        path = os.path.join(DEBUG_DIR, 'fail.png')
+        im.save(path)
+        a = np.asarray(im, dtype=np.int16)
+        h = a.shape[0]
+        zone = a[h // 3: h * 2 // 3]
+        r, g, b = zone[..., 0], zone[..., 1], zone[..., 2]
+        dark_blue = (r < 110) & (g < 110) & (b < 160) & (b > r + 20) & (b > g + 20)
+        n = int(dark_blue.sum())
+        print(f'   原始截图已存：{path}')
+        if a.max() < 10:
+            print('   截图是全黑的：手机可能禁止截屏。')
+        elif n:
+            med = np.median(zone[dark_blue], axis=0).astype(int).tolist()
+            print(f'   中间区域有 {n} 个深蓝紫色像素，中位颜色 RGB {med}（把这行和 fail.png 传给我）')
+    except Exception as e:
+        print('   存失败截图时出错：', e)
+
+
 # ---------------------------------------------------------------- 蓝牙
 class Esp:
     def __init__(self, cfg):
@@ -312,7 +336,10 @@ async def main():
 
     if args.image:
         im = Image.open(args.image).convert('RGB')
-        px, py, bx, by, info = find_piece_and_board(im, cfg)
+        try:
+            px, py, bx, by, info = find_piece_and_board(im, cfg)
+        except ValueError as e:
+            print('✗', e); save_fail(im); return
         dist, ms = compute_ms(px, py, bx, by, info['w'], cfg)
         save_debug(im, px, py, bx, by, dist, ms)
         print(f'小人 ({px:.0f},{py:.0f})  方块 ({bx:.0f},{by:.0f})  距离 {dist:.0f}  → {ms} ms')
@@ -346,6 +373,7 @@ async def main():
     fails = 0
     try:
         while True:
+            im = None
             try:
                 im = await asyncio.to_thread(screenshot, adb)
                 px, py, bx, by, info = find_piece_and_board(im, cfg)
@@ -354,7 +382,8 @@ async def main():
                 fails = 0
             except Exception as e:
                 fails += 1
-                print('✗', e, '（debug/latest.png 可能是上一张）')
+                print('✗', e)
+                save_fail(im)
                 if auto and fails < 3:
                     await asyncio.sleep(1.5)
                     continue
