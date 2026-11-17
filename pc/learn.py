@@ -32,7 +32,9 @@ EXPORT = os.path.join(HERE, 'export')
 
 NW = 540            # 学习 / 比对用的截图宽度
 MAX_RECS = 300
-TPL_W, TPL_H, TPL_FOOT = 0.18, 0.28, 0.01   # 小人模板大小（屏宽比例）；脚底下面多留一点
+# 小人模板（屏宽比例）：只切小人的身体（帽子、头、围巾），不要脚下的方块和两边的背景，
+# 否则小人站到不同颜色的方块上就认不出来。起点常常点在脚前面一点，所以底部离起点留一段。
+TPL_W, TPL_TOP, TPL_BOTTOM = 0.14, 0.30, 0.07
 MIN_SHADOW = 8      # 影子模式至少几笔才评估
 GOOD_ERR = 0.03     # 中位误差 ≤ 3% 算够准
 
@@ -177,10 +179,11 @@ def ncc_at(img, t, x, y):
 
 
 # ================================================================ 小人
-def build_templates(store, max_n=6):
-    """从最近几笔「你自己画的线」切小人模板（含左右镜像）。"""
+def build_templates(store, max_n=12, scan=60):
+    """从最近的「你自己画的线」切小人模板（含左右镜像）。
+    小人会转向（背面、侧面…），所以尽量收集不同姿势：跟已经有的样板几乎一样的就跳过。"""
     tpls = []
-    tw, th = round(TPL_W * NW), round(TPL_H * NW)
+    tw, th = round(TPL_W * NW), round((TPL_TOP - TPL_BOTTOM) * NW)
     for rec in reversed(store.recs):
         if rec.get('auto'):
             continue                       # 只信你自己画的起点，避免越学越歪
@@ -190,14 +193,19 @@ def build_templates(store, max_n=6):
             continue
         fx, fy = rec['a'][0] * NW, rec['a'][1] * NW
         x0 = round(fx - tw / 2)
-        y1 = round(fy + TPL_FOOT * NW)
+        y1 = round(fy - TPL_BOTTOM * NW)
         y0 = y1 - th
         if x0 < 0 or y0 < 0 or x0 + tw > img.shape[1] or y1 > img.shape[0]:
             continue
         crop = img[y0:y1, x0:x0 + tw]
+        if any(ncc_at(crop, T['t'], 0, 0) > 0.93 for T in tpls):
+            continue                       # 这个姿势已经有了
         tpls.append({'t': crop, 'fx': fx - x0, 'fy': fy - y0})
         tpls.append({'t': crop[:, ::-1].copy(), 'fx': tw - (fx - x0), 'fy': fy - y0})
         if len(tpls) >= max_n * 2:
+            break
+        scan -= 1
+        if scan <= 0:
             break
     return tpls
 
@@ -266,7 +274,24 @@ def find_char(im, tpls, y_range=(0.38, 0.85)):
             sc = ncc_at(big, T['t'], 2 * x + dx, 2 * y + dy)
             if sc > bs:
                 bs, bx, by = sc, 2 * x + dx, 2 * y + dy
-    return {'foot': ((bx + T['fx']) / NW, (by + T['fy']) / NW), 'score': bs}
+    foot = ((bx + T['fx']) / NW, (by + T['fy']) / NW)
+    # 第二道检查：小人一定戴红色毛线帽。比对分数会因为姿势（背面 / 侧面）掉到 0.4 左右，
+    # 但位置其实是对的；这时看找到的位置上方有没有帽子的红色。
+    hat = hat_red(small, foot)
+    ok = bs >= 0.55 or (bs >= 0.30 and 0.06 <= hat <= 0.22)
+    lost = not ok and (bs < 0.30 or hat < 0.03)     # 真的不见了（游戏结束、跳出奖励画面…）
+    return {'foot': foot, 'score': bs, 'hat': hat, 'ok': ok, 'lost': lost}
+
+
+def hat_red(small, foot):
+    """小人脚底上方（帽子那一带）红色毛线帽像素的比例。small：宽 270 的影像。"""
+    Wn = small.shape[1]
+    fx, fy = foot[0] * Wn, foot[1] * Wn
+    box = small[max(0, int(fy - 0.30 * Wn)):max(0, int(fy - 0.10 * Wn)), max(0, int(fx - 0.08 * Wn)):int(fx + 0.08 * Wn)]
+    if not box.size:
+        return 0.0
+    r, g, b = box[..., 0], box[..., 1], box[..., 2]
+    return float(((r > 140) & (g < 90) & (b < 90) & (r - g > 80)).mean())
 
 
 # ================================================================ 目标
@@ -408,8 +433,10 @@ def landing(im, tpls, jump, ch=None):
     """跳完之后量落点。jump = {'dir': (ux, uy) 跳跃方向单位向量, 'units': 原本要跳的距离}。
     回传 {'err': 沿跳跃方向偏了多少（+ 跳过头 / − 不够远，屏宽=1000）, 'traveled': 实际跳的距离}，量不到回传 None。"""
     ch = ch or find_char(im, tpls)
-    if not ch or ch['score'] < 0.55:
-        return {'lost': True}                           # 找不到小人：可能掉下去了
+    if not ch or ch.get('lost'):
+        return {'lost': True}                           # 找不到小人：可能掉下去了 / 游戏结束
+    if not ch.get('ok'):
+        return None                                     # 不太确定是不是小人：这跳不量
     face = standing_face(im, ch['foot'])
     if not face:
         return None
@@ -581,7 +608,7 @@ def predict(im, tpls, cfg, store, char_thr=0.55, ch=None):
     ch = ch or find_char(im, tpls)
     if not ch:
         return {'err': '还没有小人模板（先自己画线玩几跳）'}
-    if ch['score'] < char_thr:
+    if not ch.get('ok'):
         return {'err': f'找不到小人（信心 {ch["score"]:.2f}）', 'score': ch['score']}
     ang = learned_angle(store) or cfg.get('jump_angle_deg', 30)
     tg = find_target(im, ch['foot'], ang)
