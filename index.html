@@ -288,7 +288,7 @@ function tip(){
       : '边框好了 ✓ 可拖动角点微调';
   }else{
     n='2';
-    t=line?'拖动红/绿点可微调，或重新画一条':'从起点（你的位置）拉到终点';
+    t=line?'直接再画一条新线就会取代旧的':'从起点（你的位置）拉到终点';
   }
   $('tip').textContent=t; $('stepNo').textContent=n;
 }
@@ -348,15 +348,9 @@ c.onpointerdown=e=>{
     act={kind:'corner',i,off:{x:q.x-p.x,y:q.y-p.y},completes:fresh&&corners.length===4};
     afterCorner();
   }else{
-    const ends=line?[line.a,line.b]:[];
-    const i=nearest(ends,p);
-    if(i>=0){
-      const key=i?'b':'a', q=line[key];
-      act={kind:'end',key,off:{x:q.x-p.x,y:q.y-p.y}};
-    }else{
-      act={kind:'end',key:'b',off:{x:0,y:0},prev:line};
-      line={a:clamp(p),b:clamp(p)};
-    }
+    // 每次碰画面都重新画一条线（旧线不会挡住）
+    act={kind:'end',key:'b',off:{x:0,y:0},prev:line};
+    line={a:clamp(p),b:clamp(p)};
     calc();
   }
   loop();
@@ -437,7 +431,7 @@ function draw(){
     ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);
     ctx.lineWidth=7*d;ctx.strokeStyle='#000a';ctx.stroke();
     ctx.lineWidth=4*d;ctx.strokeStyle='#ffd83a';ctx.stroke();
-    const r=(mode==='line'?10:6)*d;
+    const r=7*d;
     dot(a.x,a.y,r,'#2fd07a','#fff'); dot(b.x,b.y,r,'#ff5a4a','#fff');
     if(units){ // 线中间显示 ms
       const mx=(a.x+b.x)/2,my=(a.y+b.y)/2,t=curMs+' ms';
