@@ -60,6 +60,8 @@ class App:
         self.pred = None           # AI 对目前画面的预测
         self.cur_rec = None        # 上一次按压的学习纪录（等你按 1/2/3）
         self.auto_fail = 0
+        self.pending = None        # 刚按完、等着量落点的那一跳 (jump, rec)
+        self.cfg.setdefault('auto_calib', True)
         self.build()
         self.root.after(50, self.poll)
         self.root.after(100, self.start)
@@ -147,6 +149,13 @@ class App:
         self.fit_btn = btn(lr, '套用拟合 k/b', self.apply_fit, font=FONT)
         self.fit_btn.pack(side='left')
         btn(lr, '清除学习', self.clear_learn, font=FONT).pack(side='left', padx=6)
+        self.v_calib = tk.BooleanVar(value=bool(self.cfg['auto_calib']))
+
+        def on_calib():
+            self.cfg['auto_calib'] = self.v_calib.get(); jb.save_config(self.cfg)
+        tk.Checkbutton(lf, text='跳完自动量落点、校准 k/b', variable=self.v_calib, command=on_calib, font=FONT,
+                       bg='#24272e', fg=TEXT, selectcolor='#262a31', activebackground='#24272e',
+                       activeforeground=TEXT, anchor='w').pack(fill='x', pady=(4, 0))
         self.v_play = tk.BooleanVar(value=False)
         tk.Checkbutton(lf, text='AI 自动玩（Esc 停止）', variable=self.v_play, command=self.toggle_play, font=FONT_B,
                        bg='#24272e', fg='#e9a0ff', selectcolor='#262a31', activebackground='#24272e',
@@ -396,8 +405,21 @@ class App:
             self.last = {'ms': self.ms, 'units': self.units}
             p = self.pred if self.pred and 'units' in self.pred else None
             self.cur_rec = self.store.add(self.img, self.line['a'], self.line['b'], self.units, self.ms, pred=p)
+            self.pending = (self.make_jump(self.line['a'], self.line['b'], self.units), self.cur_rec)
             self.tpls = learn.build_templates(self.store)     # 学新的小人样子
             self.update_learn()
+
+    def make_jump(self, a, b, units):
+        """这一跳原本要跳的方向和距离。AI 有量到目标、而且跟你画的终点差不多时，用 AI 量的（比较精确）。"""
+        W = self.img.size[0]
+        p = self.pred
+        if p and 'center' in p:
+            pc = (p['center'][0] * W, p['center'][1] * W)
+            if math.hypot(pc[0] - b[0], pc[1] - b[1]) < 0.06 * W:
+                a, b, units = (p['foot'][0] * W, p['foot'][1] * W), pc, p['raw_units']
+        dx, dy = b[0] - a[0], b[1] - a[1]
+        n = math.hypot(dx, dy) or 1.0
+        return {'dir': (dx / n, dy / n), 'units': units}
 
     def press(self, ms):
         if self.busy:
@@ -416,11 +438,11 @@ class App:
             self.status(f'按压失败：{err}（蓝牙可能断了，重新连接）', 'err')
             self.esp = None; self.bt.config(text='连接蓝牙', bg='#3b7cff')
             return
-        self.status(f'已按 {ms} ms ✓ 结果怎样？按 1 太久 / 2 刚好 / 3 太短', 'ok')
+        self.status(f'已按 {ms} ms ✓ 等画面停下来量落点…（也可以按 1 太久 / 2 刚好 / 3 太短）', 'ok')
 
         def done():
             self.busy = False; self.press_btn.config(state='normal')
-            self.line = None; self.recalc(); self.refresh(stable=self.v_play.get())   # 新画面、清掉旧线
+            self.line = None; self.recalc(); self.refresh(stable=True)   # 等镜头停下来再截图（才能量落点）
         self.root.after(int(self.cfg['wait_after'] * 1000), done)
 
     # ------------------------------------------------------------ 校准
@@ -452,15 +474,71 @@ class App:
         if not self.img or not self.tpls:
             self.update_learn(); return
         img, tpls = self.img, self.tpls
-        self.bg(lambda: learn.predict(img, tpls, self.cfg, self.store), lambda p, err: self.after_pred(img, p, err))
+        pend, self.pending = self.pending, None
 
-    def after_pred(self, img, p, err):
+        def work():
+            land = learn.landing(img, tpls, pend[0]) if pend else None
+            return learn.predict(img, tpls, self.cfg, self.store), land
+        self.bg(work, lambda res, err: self.after_pred(img, res, err, pend))
+
+    def after_pred(self, img, res, err, pend=None):
+        p, land = res if res else ({'err': str(err)}, None)
+        if pend:
+            self.handle_landing(land, pend)
         if img is not self.img:
             return                                   # 画面已经换了
-        self.pred = {'err': str(err)} if err else p
+        if 'units' in p:                             # k/b 可能刚被校准过：用最新的重算 ms
+            ms = p['units'] * self.cfg['k'] + self.cfg['b']
+            p['ms'] = int(round(max(self.cfg['min_ms'], min(self.cfg['max_ms'], ms))))
+        self.pred = p
         self.draw(); self.update_learn()
         if self.v_play.get():
             self.root.after(150, self.auto_step)
+
+    def handle_landing(self, land, pend):
+        jump, rec = pend
+        if land is None:
+            self.status('量不到这一跳的落点（这块没有奶油色顶面），可以按 1/2/3 告诉我结果', 'warn'); return
+        if land.get('lost'):
+            self.status('⚠ 跳完找不到小人：可能掉下去了（游戏结束？）', 'err')
+            if self.v_play.get():
+                self.v_play.set(False)
+            return
+        e, units = land['err'], jump['units']
+        rec['land'] = {'err': round(e, 1), 'traveled': round(land['traveled'], 1)}
+        if rec.get('r') is None:                     # 自动填结果（你按 1/2/3 会覆盖）
+            pct = e / max(1.0, units)
+            rec['r'] = 0 if abs(pct) < 0.03 else (-1 if pct > 0 else 1)
+            rec['est'] = int(round(rec['ms'] * units / max(1.0, land['traveled'])))
+        self.store.save()
+        pct = e / max(1.0, units) * 100
+        msg = ('🎯 几乎正中' if abs(pct) < 2 else ('跳过头' if e > 0 else '不够远')) + f' {abs(e):.0f}（{pct:+.1f}%）'
+        if self.v_calib.get():
+            msg += self.calibrate(rec, jump)
+        self.status('落点：' + msg, 'ok' if abs(pct) < 3 else 'warn')
+
+    def calibrate(self, rec, jump):
+        f = learn.fit_land(self.store)
+        if f and f['rms'] < 30:
+            k, b = round(f['k'], 4), round(f['b'])
+            how = f'（{f["n"]} 跳拟合，误差 ±{f["rms"]:.0f} ms）'
+        else:
+            # 资料还不够：用这一跳单独修 k（只修一部分，避免一次量错就乱掉）
+            traveled = rec['land']['traveled']
+            if traveled < 50:
+                return ''
+            k_true = (rec['ms'] - self.cfg['b']) / traveled
+            k = round(max(0.01, self.cfg['k'] + 0.6 * (k_true - self.cfg['k'])), 4)
+            b = self.cfg['b']
+            how = '（单跳修正）'
+        if k == self.cfg['k'] and b == self.cfg['b']:
+            return ''
+        self.cfg['k'], self.cfg['b'] = k, b
+        jb.save_config(self.cfg)
+        for e, key in ((self.e_k, 'k'), (self.e_b, 'b')):
+            e.delete(0, 'end'); e.insert(0, str(self.cfg[key]))
+        self.recalc()
+        return f' → k = {k}, b = {b}{how}'
 
     def update_learn(self):
         recs = self.store.recs
@@ -479,6 +557,10 @@ class App:
             lines.append(f'这张：AI 预测 {p["ms"]} ms（小人信心 {p["score"]:.2f}）' if 'ms' in p else f'这张：{p["err"]}')
         elif not self.tpls:
             lines.append('先自己画线玩几跳，AI 就会开始学小人的样子')
+        ls = learn.land_stats(self.store)
+        if ls:
+            lines.append(f'落点（最近 {ls["n"]} 跳）：平均偏 {ls["mean"] * 100:.1f}%，上一跳 {ls["last"]:+.0f}'
+                         f'（共量到 {learn.land_count(self.store)} 跳）')
         f = learn.fit_kb(self.store)
         self.fit = f if 'k' in f else None
         if self.fit:
@@ -514,7 +596,8 @@ class App:
         if not self.tpls:
             self.v_play.set(False); self.status('AI 还没学过：先自己画线玩几跳', 'warn'); return
         sh = learn.shadow_stats(self.store)
-        if not sh.get('ok') and not messagebox.askyesno(
+        ready = sh.get('ok') or (learn.fit_land(self.store) is not None)
+        if not ready and not messagebox.askyesno(
                 'AI 还不够准',
                 f'AI 跟你的比较：{sh["n"]} 跳，中位误差 {sh.get("med", 0) * 100:.1f}%。\n'
                 f'（建议 ≥{learn.MIN_SHADOW} 跳、≤{learn.GOOD_ERR * 100:.0f}%）\n\n还是要让它自己玩吗？'):
@@ -545,6 +628,7 @@ class App:
         if self.press(p['ms']):
             self.last = {'ms': p['ms'], 'units': p['units']}
             self.cur_rec = self.store.add(self.img, a, b, p['units'], p['ms'], pred=p, auto=True)
+            self.pending = (self.make_jump(a, b, p['units']), self.cur_rec)
             self.update_learn()
 
 

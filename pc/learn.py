@@ -294,6 +294,52 @@ def find_face(img, fx, fy, angle_deg, Wn):
             'method': 'face'}
 
 
+def cream_mask(img):
+    r, g, b = img[..., 0], img[..., 1], img[..., 2]
+    return (r > 225) & (g > 205) & (b > 165) & (r - b > 18) & (r - b < 80) & (r - g > 3) & (r - g < 30)
+
+
+def standing_face(im, foot):
+    """小人现在站的那块顶面的中心（屏宽比例）。小人会挡住顶面中间，
+    所以用顶面最左、最右两个点：菱形和椭圆的左右端点都在中心高度，中点就是中心。"""
+    Wn = NW // 2
+    img = as_arr(im, Wn)
+    fx, fy = foot[0] * Wn, foot[1] * Wn
+    cream = cream_mask(img)
+    lab, sizes = _label(_dilate(cream))
+    ya, yb = max(0, int(fy - 0.10 * Wn)), int(fy + 0.06 * Wn)
+    xa, xb = max(0, int(fx - 0.15 * Wn)), int(fx + 0.15 * Wn)
+    labs = [int(v) for v in np.unique(lab[ya:yb, xa:xb]) if v and sizes[int(v)] >= 0.001 * Wn * Wn]
+    if not labs:
+        return None                                    # 没有奶油色顶面（例如金币）
+    m = np.isin(lab, labs) & cream
+    ys, xs = np.nonzero(m)
+    if xs.max() - xs.min() < 0.15 * Wn or (ys.max() - ys.min()) / (xs.max() - xs.min()) > 0.9:
+        return None
+    xl, xr = xs.min(), xs.max()
+    yl = ys[xs <= xl + 1].mean()
+    yr = ys[xs >= xr - 1].mean()
+    return {'center': ((xl + xr) / 2 / Wn, (yl + yr) / 2 / Wn), 'width': (xr - xl) / Wn}
+
+
+def landing(im, tpls, jump):
+    """跳完之后量落点。jump = {'dir': (ux, uy) 跳跃方向单位向量, 'units': 原本要跳的距离}。
+    回传 {'err': 沿跳跃方向偏了多少（+ 跳过头 / − 不够远，屏宽=1000）, 'traveled': 实际跳的距离}，量不到回传 None。"""
+    ch = find_char(im, tpls)
+    if not ch or ch['score'] < 0.55:
+        return {'lost': True}                           # 找不到小人：可能掉下去了
+    face = standing_face(im, ch['foot'])
+    if not face:
+        return None
+    ux, uy = jump['dir']
+    dx = (ch['foot'][0] - face['center'][0]) * 1000
+    dy = (ch['foot'][1] - face['center'][1]) * 1000
+    err = dx * ux + dy * uy
+    if abs(err) > face['width'] * 1000 * 0.7:           # 偏太多：可能不是站在这块上，不采用
+        return None
+    return {'err': err, 'traveled': jump['units'] + err}
+
+
 def find_target(im, foot, angle_deg=30, diff_thr=45):
     """foot：屏宽比例。回传 {'center': (x, y) 屏宽比例, 'top', 'side', 'width'} 或 None。
     先用奶油色顶面找；找不到（例如金币）再用「物体外形」的方法。"""
@@ -465,12 +511,52 @@ def predict(im, tpls, cfg, store, char_thr=0.55):
         t = math.radians(cfg.get('jump_angle_deg', 30))
         raw_units = max(abs(dx * math.cos(t) - dy * math.sin(t)), abs(-dx * math.cos(t) - dy * math.sin(t))) * 1000
     st = shadow_stats(store)
-    corr = st['ratio'] if st['n'] >= 5 else 1.0              # 依你的画线习惯修正比例
+    # 依你的画线习惯修正比例；一旦有足够的落点资料（真正的物理结果），就不需要了
+    corr = st['ratio'] if st['n'] >= 5 and land_count(store) < MIN_LAND else 1.0
     units = raw_units * corr
     ms = units * cfg['k'] + cfg['b']
     ms = int(round(max(cfg['min_ms'], min(cfg['max_ms'], ms))))
     return {'foot': ch['foot'], 'center': tg['center'], 'top': tg['top'], 'side': tg['side'],
             'score': ch['score'], 'raw_units': raw_units, 'units': units, 'corr': corr, 'ms': ms, 'angle': ang}
+
+
+MIN_LAND = 6
+
+
+def land_count(store):
+    return sum(1 for r in store.recs if r.get('land'))
+
+
+def fit_land(store, n=40):
+    """用量到的落点拟合：按了 ms → 实际跳了 traveled。ms = k × traveled + b。"""
+    pts = [(r['land']['traveled'], r['ms']) for r in store.recs if r.get('land')][-n:]
+    if len(pts) < MIN_LAND:
+        return None
+    x = np.array([p[0] for p in pts], float)
+    y = np.array([p[1] for p in pts], float)
+    if x.max() - x.min() < 80:
+        return None
+    keep = np.ones(len(x), bool)
+    for _ in range(2):                                   # 去掉离群的（例如量错的那几跳）再算一次
+        A = np.vstack([x[keep], np.ones(keep.sum())]).T
+        (k, b), *_ = np.linalg.lstsq(A, y[keep], rcond=None)
+        res = np.abs(x * k + b - y)
+        mad = np.median(res[keep]) + 1e-6
+        keep = res <= max(3 * mad, 15)
+        if keep.sum() < MIN_LAND:
+            return None
+    rms = float(np.sqrt(((x[keep] * k + b - y[keep]) ** 2).mean()))
+    if k <= 0:
+        return None
+    return {'k': float(k), 'b': float(b), 'rms': rms, 'n': int(keep.sum())}
+
+
+def land_stats(store, n=10):
+    rs = [r for r in store.recs if r.get('land')][-n:]
+    if not rs:
+        return None
+    errs = [abs(r['land']['err']) / max(1.0, r['land']['traveled'] - r['land']['err']) for r in rs]
+    return {'n': len(rs), 'mean': float(np.mean(errs)), 'last': rs[-1]['land']['err']}
 
 
 def fit_kb(store, proj=True):
