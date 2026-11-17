@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import queue
+import random
 import threading
 import time
 import tkinter as tk
@@ -66,6 +67,8 @@ class App:
         self.auto_fail = 0
         self.pending = None        # 刚按完、等着量落点的那一跳 (jump, rec)
         self.cfg.setdefault('auto_calib', True)
+        self.cfg.setdefault('miss_pct', 10)        # AI 自动玩时，故意不跳正中的机率（%）
+        self.cfg.setdefault('miss_amount', 0.6)    # 故意偏离最多到「中心→边缘」距离的几成
         self.build()
         self.root.after(50, self.poll)
         self.root.after(100, self.start)
@@ -186,7 +189,7 @@ class App:
         self.export_btn.pack(side='left')
 
         # 落点误差图
-        c = card(colB, '🎯 落点误差（最近 30 跳，绿 = ±3% 内）')
+        c = card(colB, '🎯 落点误差（最近 30 跳，绿 = ±3% 内，黄框 = 故意偏离）')
         self.chart = tk.Canvas(c, bg='#15171b', highlightthickness=0, height=130, width=400)
         self.chart.pack(fill='x')
         self.chart.bind('<Configure>', lambda e: self.draw_chart())
@@ -224,6 +227,11 @@ class App:
         self.e_b = entry('b (ms)', 'b')
         self.e_ang = entry('跳跃角度 (°)', 'jump_angle_deg')
         self.e_wait = entry('按完等几秒', 'wait_after')
+        self.e_miss = entry('故意偏离机率 %', 'miss_pct')
+        self.e_miss_amt = entry('偏离幅度 0~0.7', 'miss_amount')
+        tk.Label(c, text='AI 自动玩时，大约这个比例的跳会故意不跳正中（只往跳跃方向偏远或偏近，\n'
+                         '最多偏到中心→边缘距离的这几成，一定还在平台上）。小平台（宽 < 屏宽 25%）一律瞄正中。',
+                 font=('Microsoft YaHei UI', 9), bg=CARD, fg=SUB, justify='left').pack(anchor='w')
         self.info_lbl = tk.Label(c, text='', font=('Microsoft YaHei UI', 10), bg=CARD, fg=SUB, justify='left')
         self.info_lbl.pack(anchor='w', pady=(6, 0))
         tk.Label(c, text='按压时间 = 距离 × k + b（距离：手机屏幕宽 = 1000）\n\n'
@@ -296,11 +304,12 @@ class App:
         bw = (W - 70) / 30
         for i, r in enumerate(rs):
             units = max(1.0, r['land']['traveled'] - r['land']['err'])
-            pct = r['land']['err'] / units * 100
+            pct = (r['land']['err'] - (r.get('aim') or 0)) / units * 100   # 跟「想跳的地方」比
             h = max(-1.0, min(1.0, pct / lim)) * (H / 2 - 8)
             col = '#2fd07a' if abs(pct) < 3 else '#e5a12a' if abs(pct) < 6 else '#ff6b55'
             x = 64 + i * bw
-            c.create_rectangle(x, mid, x + bw * 0.7, mid - h, fill=col, outline='#e9a0ff' if r.get('auto') else '')
+            c.create_rectangle(x, mid, x + bw * 0.7, mid - h, fill=col,
+                               outline='#ffd83a' if r.get('aim') else ('#e9a0ff' if r.get('auto') else ''))
 
     def update_history(self):
         t = self.hist
@@ -310,8 +319,10 @@ class App:
             land, tag = '—', ''
             if r.get('land'):
                 units = max(1.0, r['land']['traveled'] - r['land']['err'])
-                pct = r['land']['err'] / units * 100
+                pct = (r['land']['err'] - (r.get('aim') or 0)) / units * 100
                 land = f'{pct:+.1f}%' + (' 🎯' if abs(pct) < 2 else '')
+                if r.get('aim'):
+                    land = f'故意{r["aim"]:+.0f} · ' + land
                 tag = 'good' if abs(pct) < 3 else 'bad'
             t.insert('', 'end', values=(n - i, 'AI' if r.get('auto') else '你', f'{r["units"]:.0f}', r['ms'], land),
                      tags=(tag,))
@@ -670,15 +681,20 @@ class App:
                 self.v_play.set(False)
             return
         e, units = land['err'], jump['units']
+        aim = rec.get('aim', 0) or 0
+        e_rel = e - aim                                # 扣掉故意偏离的量
         rec['land'] = {'err': round(e, 1), 'traveled': round(land['traveled'], 1),
                        'foot': land.get('foot'), 'face': land.get('face'), 'score': land.get('score')}
         if rec.get('r') is None:                     # 自动填结果（你按 1/2/3 会覆盖）
-            pct = e / max(1.0, units)
+            pct = e_rel / max(1.0, units)
             rec['r'] = 0 if abs(pct) < 0.03 else (-1 if pct > 0 else 1)
             rec['est'] = int(round(rec['ms'] * units / max(1.0, land['traveled'])))
         self.store.save()
-        pct = e / max(1.0, units) * 100
-        msg = ('🎯 几乎正中' if abs(pct) < 2 else ('跳过头' if e > 0 else '不够远')) + f' {abs(e):.0f}（{pct:+.1f}%）'
+        pct = e_rel / max(1.0, units) * 100
+        if aim:
+            msg = (f'故意{"偏远" if aim > 0 else "偏近"} {abs(aim):.0f}，实际 {e:+.0f}（跟瞄的点差 {pct:+.1f}%）')
+        else:
+            msg = ('🎯 几乎正中' if abs(pct) < 2 else ('跳过头' if e > 0 else '不够远')) + f' {abs(e):.0f}（{pct:+.1f}%）'
         if self.v_calib.get():
             msg += self.calibrate(rec, jump)
         self.status('落点：' + msg, 'ok' if abs(pct) < 3 else 'warn')
@@ -827,12 +843,40 @@ class App:
         W = self.img.size[0]
         a = (p['foot'][0] * W, p['foot'][1] * W)
         b = (p['center'][0] * W, p['center'][1] * W)
-        if self.press(p['ms']):
-            self.last = {'ms': p['ms'], 'units': p['units']}
-            self.cur_rec = self.store.add(self.img, a, b, p['units'], p['ms'], pred=p, auto=True,
-                                          extra=self.press_extra())
+        aim = self.pick_aim(p)
+        ms = p['ms']
+        if aim:
+            ms = int(round(max(self.cfg['min_ms'], min(self.cfg['max_ms'],
+                                                       (p['units'] + aim) * self.cfg['k'] + self.cfg['b']))))
+        if self.press(ms):
+            if aim:
+                self.status(f'🤖 这跳故意不跳正中：{"偏远" if aim > 0 else "偏近"} {abs(aim):.0f}（{ms} ms）', 'ok')
+            self.last = {'ms': ms, 'units': p['units'] + aim}
+            extra = self.press_extra()
+            extra['aim'] = round(aim, 1)
+            self.cur_rec = self.store.add(self.img, a, b, p['units'], ms, pred=p, auto=True, extra=extra)
             self.pending = (self.make_jump(a, b, p['units']), self.cur_rec)
             self.update_learn()
+
+    def pick_aim(self, p):
+        """要不要故意不跳正中：回传沿跳跃方向偏多少（+ 偏远 / − 偏近，屏宽 = 1000），0 = 瞄正中。
+        顶面中心到边缘（沿跳跃方向）大约是顶面宽度的 0.29 倍；最多偏到这段的 miss_amount 成，
+        再留一点按压误差的余地，保证还在平台上。小平台一律瞄正中。"""
+        try:
+            pct = float(self.cfg.get('miss_pct', 0))
+            amt = min(0.7, max(0.0, float(self.cfg.get('miss_amount', 0.6))))   # 上限 0.7：再加按压误差也不会碰到边缘
+        except (TypeError, ValueError):
+            return 0.0
+        w = p.get('width') or 0
+        if pct <= 0 or amt <= 0 or w < 0.25 or random.random() * 100 >= pct:
+            return 0.0
+        edge = 0.29 * w * 1000                         # 中心 → 边缘
+        margin = 0.03 * p['units']                     # 按压的随机误差约 ±3%
+        hi = max(0.0, amt * edge - margin)
+        lo = min(hi, 0.35 * edge)
+        if hi < 15:
+            return 0.0
+        return random.uniform(lo, hi) * random.choice((-1, 1))
 
 
 def main():

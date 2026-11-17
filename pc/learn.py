@@ -370,14 +370,23 @@ def find_face(img, fx, fy, angle_deg, Wn):
     found = []
     for side in (1, -1):
         ux, uy = side * math.cos(t), -math.sin(t)
+        first, best = None, None
         for s in range(2, int(1.3 * Wn)):
+            if first is not None and s > first + 0.25 * Wn:
+                break
             x, y = int(round(fx + ux * s)), int(round(fy + uy * s))
             if not (0 <= x < Wn and 0 <= y < Hn):
                 break
             L = int(lab[y, x])
             if L and L not in cur and sizes[L] >= min_area and is_face(L):
-                found.append((s, side, L))
-                break
+                # 第一块碰到的可能是方块前面的装饰（例如炸鸡盘前面的荷包蛋，颜色跟顶面一样）；
+                # 再往前看一小段，选最大的那一块才是真正的顶面
+                if first is None:
+                    first = s
+                if best is None or sizes[L] > sizes[best[1]]:
+                    best = (first, L)
+        if best:
+            found.append((best[0], side, best[1]))
     if not found:
         return None
     s, side, L = min(found)
@@ -628,7 +637,8 @@ def predict(im, tpls, cfg, store, char_thr=0.55, ch=None):
     ms = units * cfg['k'] + cfg['b']
     ms = int(round(max(cfg['min_ms'], min(cfg['max_ms'], ms))))
     return {'foot': ch['foot'], 'center': tg['center'], 'top': tg['top'], 'side': tg['side'],
-            'score': ch['score'], 'raw_units': raw_units, 'units': units, 'corr': corr, 'ms': ms, 'angle': ang}
+            'score': ch['score'], 'raw_units': raw_units, 'units': units, 'corr': corr, 'ms': ms, 'angle': ang,
+            'width': tg.get('width', 0)}
 
 
 MIN_LAND = 6
@@ -666,8 +676,9 @@ def land_stats(store, n=10):
     rs = [r for r in store.recs if r.get('land')][-n:]
     if not rs:
         return None
-    errs = [abs(r['land']['err']) / max(1.0, r['land']['traveled'] - r['land']['err']) for r in rs]
-    return {'n': len(rs), 'mean': float(np.mean(errs)), 'last': rs[-1]['land']['err']}
+    # 故意不跳正中的那几跳：扣掉故意偏的量，只算「没跳到想跳的地方」的误差
+    errs = [abs(r['land']['err'] - r.get('aim', 0)) / max(1.0, r['land']['traveled'] - r['land']['err']) for r in rs]
+    return {'n': len(rs), 'mean': float(np.mean(errs)), 'last': rs[-1]['land']['err'] - rs[-1].get('aim', 0)}
 
 
 def fit_kb(store, proj=True):
@@ -701,7 +712,8 @@ def export(store, cfg, extra_info=None):
 
     # 每一跳一行，Excel 可以直接打开（utf-8-sig 让 Excel 认得中文）
     rows = [['#', 'id', '时间', '谁', '距离', '按压ms', '当时k', '当时b', 'AI预测距离', 'AI小人信心',
-             '落点偏差', '落点偏差%', '实际跳的距离', '结果(-1太久 0刚好 1太短)', '按下时间', 'ESP回报按完时间']]
+             '落点偏差', '落点偏差%', '实际跳的距离', '结果(-1太久 0刚好 1太短)', '按下时间', 'ESP回报按完时间',
+             '故意偏离']]
     for i, r in enumerate(recs, 1):
         land = r.get('land') or {}
         units = (land.get('traveled', 0) - land.get('err', 0)) if land else 0
@@ -710,7 +722,7 @@ def export(store, cfg, extra_info=None):
         rows.append([i, r['id'], r['id'][:15], 'AI' if r.get('auto') else '你', r['units'], r['ms'],
                      r.get('k_used', ''), r.get('b_used', ''), pred.get('units', ''), pred.get('score', ''),
                      land.get('err', ''), pct, land.get('traveled', ''), '' if r.get('r') is None else r['r'],
-                     r.get('t_press', ''), r.get('t_done', '')])
+                     r.get('t_press', ''), r.get('t_done', ''), r.get('aim', '')])
     lc = land_count(store)
     sh = shadow_stats(store)
     ls = land_stats(store)
