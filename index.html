@@ -250,9 +250,9 @@
     <div id="pgrid"></div>
   </div>
   <div class="fb">
-    <button id="less">− 太久</button>
+    <button id="less">跳太远 −</button>
     <button id="ok">✓ 刚好</button>
-    <button id="more">＋ 太短</button>
+    <button id="more">跳太近 ＋</button>
   </div>
 </div>
 
@@ -598,14 +598,14 @@ function loupe(){
 }
 
 // ---------- 快/慢 校准 ----------
-// 「太久/太短/刚好」作用在「上一次按的东西」：
+// 「跳太远/跳太近/刚好」作用在「上一次按的东西」：
 //   画线按的 → 把上一次的按压时间 ±step，反推新的 k；方向跟上次相反 → step 减半（逐步逼近）。
 //   预设按的 → 只调整那个预设自己的 ms（不动 k），每个预设有自己的幅度。
 let lastTarget=null;    // {type:'line'} | {type:'preset',id} | {type:'manual'}
 let lastPressMs=0;      // 上一次按的 ms（不管怎么按的）
 function feedback(dir){
   if(lastTarget&&lastTarget.type==='preset') return presetFeedback(dir);
-  if(!lastTarget||lastTarget.type!=='line'||!last.units){st('先用「按！」或预设按一次，再告诉我太久还是太短','warn');return}
+  if(!lastTarget||lastTarget.type!=='line'||!last.units){st('先用「按！」或预设按一次，再告诉我跳太远还是跳太近','warn');return}
   if(lastDir&&dir!==lastDir) step=Math.max(0.01,step/2);
   lastDir=dir;
   const b=+$('b').value, newMs=last.ms*(1+dir*step);
@@ -677,7 +677,7 @@ async function pressPreset(p){
   if(await press(p.ms)){
     lastTarget={type:'preset',id:p.id}; lastPressMs=p.ms;
     renderPresets(); showMs();
-    st(`按预设 ${p.ms} ms… 太久/太短只会调整这个预设`);
+    st(`按预设 ${p.ms} ms… 跳太远/跳太近只会调整这个预设`);
   }
 }
 function presetFeedback(dir){
@@ -705,8 +705,8 @@ $('preAdd').onclick=()=>{
 };
 
 // ---------- 历史记录 → 拟合 k / b ----------
-// 每次「画线按压」记一笔；之后按的「太久/刚好/太短」当作结果：
-//   太久 → 理想 ms ≈ 实际 ×(1−幅度)，太短 → ×(1+幅度)，刚好 → 实际值。
+// 每次「画线按压」记一笔；之后按的「跳太远/刚好/跳太近」当作结果：
+//   跳太远 → 理想 ms ≈ 实际 ×(1−幅度)，跳太近 → ×(1+幅度)，刚好 → 实际值。
 // 有 8 笔以上就用最小二乘法算 理想ms = k × 距离 + b。
 let hist=store.get('hist',[]), lastRec=null, fitRes=null;
 if(!Array.isArray(hist)) hist=[];
@@ -734,7 +734,7 @@ function fitHist(){
 }
 function showFit(){
   const f=fitHist(), c=f.cnt;
-  let t=`共 ${hist.length} 笔（最多留 100）；${projOn()?'投影':'不投影'}模式有结果的 ${f.n} 笔：太久 ${c['-1']} / 刚好 ${c['0']} / 太短 ${c['1']}`;
+  let t=`共 ${hist.length} 笔（最多留 100）；${projOn()?'投影':'不投影'}模式有结果的 ${f.n} 笔：跳太远 ${c['-1']} / 刚好 ${c['0']} / 跳太近 ${c['1']}`;
   fitRes=null;
   if(f.n<8) t+=`\n再 ${8-f.n} 笔就能拟合。`;
   else if(f.bad||!(f.k>0)) t+='\n距离都太接近，算不出来；多试几种远近。';

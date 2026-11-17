@@ -7,7 +7,7 @@
 
 快捷键：
   空白键 = 按       R = 重新截图       右键 = 清除线
-  1 = 太久          2 = 刚好           3 = 太短         Esc = 停止 AI 自动玩
+  1 = 跳太远        2 = 刚好           3 = 跳太近         Esc = 停止 AI 自动玩
 
 学习：你每画一条线按一次，都会记下来（pc/data/）。AI 会学小人的样子、跳跃角度和 k/b，
      并在你玩的时候偷偷预测（紫色虚线），跟你画的比较；够准了再打开「AI 自动玩」。
@@ -152,9 +152,9 @@ class App:
                              font=('Microsoft YaHei UI', 18, 'bold'))
         self.press_btn.pack(fill='x', pady=(12, 8))
         fb = tk.Frame(c, bg=CARD); fb.pack(fill='x')
-        btn(fb, '− 太久 (1)', lambda: self.feedback(-1), bg='#d9472f', fg='#fff').pack(side='left', fill='x', expand=True)
+        btn(fb, '跳太远 (1)', lambda: self.feedback(-1), bg='#d9472f', fg='#fff').pack(side='left', fill='x', expand=True)
         btn(fb, '✓ 刚好 (2)', self.ok, bg='#1fa955', fg='#fff').pack(side='left', fill='x', expand=True, padx=6)
-        btn(fb, '＋ 太短 (3)', lambda: self.feedback(1), bg='#d58f12', fg='#fff').pack(side='left', fill='x', expand=True)
+        btn(fb, '跳太近 (3)', lambda: self.feedback(1), bg='#d58f12', fg='#fff').pack(side='left', fill='x', expand=True)
         self.v_play = tk.BooleanVar(value=False)
         self.play_btn = btn(c, '🤖 AI 自动玩 (A)', self.toggle_play_btn, bg='#7b3fe4', fg='#fff',
                             font=('Microsoft YaHei UI', 15, 'bold'))
@@ -247,7 +247,7 @@ class App:
         self.info_lbl.pack(anchor='w', pady=(6, 0))
         tk.Label(c, text='按压时间 = 距离 × k + b（距离：手机屏幕宽 = 1000）\n\n'
                          '快捷键：空白键 按 · R 截图 · 右键 清除线\n'
-                         '1 太久 · 2 刚好 · 3 太短 · A AI 自动玩 · Esc 停止',
+                         '1 跳太远 · 2 刚好 · 3 跳太近 · A AI 自动玩 · Esc 停止',
                  font=('Microsoft YaHei UI', 10), bg=CARD, fg=SUB, justify='left').pack(anchor='w', pady=(8, 0))
 
         self.show_info()
@@ -625,7 +625,7 @@ class App:
             return
         if self.cur_rec is not None and self.cur_rec.get('ms') == ms:
             self.cur_rec['t_done'] = round(time.time(), 3)      # ESP 回报按完的时间
-        self.status(f'已按 {ms} ms ✓ 等画面停下来量落点…（也可以按 1 太久 / 2 刚好 / 3 太短）', 'ok')
+        self.status(f'已按 {ms} ms ✓ 等画面停下来量落点…（也可以按 1 跳太远 / 2 刚好 / 3 跳太近）', 'ok')
 
         def done():
             self.busy = False; self.press_btn.config(state='normal')
@@ -635,7 +635,9 @@ class App:
     # ------------------------------------------------------------ 校准
     def feedback(self, d):
         if not self.last:
-            self.status('先画线按一次，再告诉我太久还是太短', 'warn'); return
+            self.status('先画线按一次，再告诉我跳太远还是跳太近', 'warn'); return
+        if self.v_calib.get():
+            return self.user_result(d)
         if self.last_dir and d != self.last_dir:
             self.cfg['step'] = max(0.005, self.cfg['step'] / 2)
         self.last_dir = d
@@ -650,6 +652,8 @@ class App:
         self.show_info(); self.recalc()
 
     def ok(self):
+        if self.v_calib.get() and self.last:
+            return self.user_result(0)
         if self.last:
             self.store.set_result(self.cur_rec, 0, self.last['ms']); self.update_learn()
             self.store.event('feedback', id=self.cur_rec and self.cur_rec['id'], result=0)
@@ -657,6 +661,39 @@ class App:
         jb.save_config(self.cfg); self.show_info()
         self.status(f'👍 调整幅度收窄为 ±{self.cfg["step"] * 100:.1f}%', 'ok')
 
+
+    def user_result(self, d):
+        """开着自动校准时，「跳太远 / 刚好 / 跳太近」不直接改 k，而是告诉程序这一跳的结果，
+        交给同一套校准处理（不然两边会互相打架）。同一跳按几次都只算一次。
+        d：-1 跳太远、0 刚好、+1 跳太近。"""
+        rec = self.cur_rec
+        if rec is None:
+            return
+        units = rec['units'] or 1.0
+        names = {-1: '跳太远', 0: '刚好', 1: '跳太近'}
+        L = rec.get('land')
+        if L and not L.get('fell') and not L.get('user'):
+            pct = (L['err'] - (rec.get('aim') or 0)) / units
+            # 量到的落点跟你说的差不多：用量到的（比较精确）；明显矛盾才相信你（可能量错了）
+            conflict = (d == -1 and pct < -0.04) or (d == 1 and pct > 0.04) or (d == 0 and abs(pct) > 0.08)
+            if not conflict:
+                rec['r'] = d
+                self.store.save()
+                self.store.event('feedback', id=rec['id'], result=d, used='measured')
+                self.status(f'已记下：{names[d]}。量到的落点是 {pct * 100:+.1f}%，差不多，以量到的为准（自动校准已经处理）', 'ok')
+                self.update_learn()
+                return
+        # 没量到、掉下去了、或跟量到的矛盾 → 用你说的结果（跳太远 ≈ 远了 6%）
+        traveled = units * (1 - 0.06 * d) + (rec.get('aim') or 0)
+        first = not (L and L.get('user'))
+        rec['land'] = {'err': round(traveled - units, 1), 'traveled': round(traveled, 1), 'user': True}
+        rec['r'] = d
+        self.store.save()
+        self.store.event('feedback', id=rec['id'], result=d, used='user')
+        msg = f'已记下：{names[d]}'
+        if first:                                    # 同一跳按很多次只校准一次
+            msg += self.calibrate(rec, None)
+        self.status(msg, 'ok'); self.update_learn()
 
     # ------------------------------------------------------------ 学习 / AI
     def predict_async(self):
@@ -786,7 +823,8 @@ class App:
         else:
             lines.append(f'有结果的 {f["n"]} 笔（按 1/2/3），满 8 笔就能拟合 k/b')
         self.learn_lbl.config(text='\n'.join(lines))
-        self.fit_btn.config(state='normal' if self.fit else 'disabled')
+        # 开着自动校准时停用：这个拟合是用 1/2/3 的粗略结果算的，会跟自动校准打架
+        self.fit_btn.config(state='normal' if self.fit and not self.v_calib.get() else 'disabled')
         self.draw_chart()
         self.update_history()
 
