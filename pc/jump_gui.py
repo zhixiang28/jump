@@ -72,6 +72,12 @@ class App:
         self.cfg.setdefault('miss_pct', 10)        # AI 自动玩时，故意不跳正中的机率（%）
         self.cfg.setdefault('miss_amount', 0.6)    # 故意偏离最多到「中心→边缘」距离的几成
         self.cfg.setdefault('target_score', 0)     # 目标分数：AI 自动玩到这个分数就故意失误结束（0 = 不限）
+        self.reset_msg = ''
+        if not learn.sane_calibration(self.cfg):   # 例如之前学坏的 k = 0.30、b = 524
+            self.reset_msg = (f'⚠ 之前的 k = {self.cfg.get("k")}、b = {self.cfg.get("b")} 不合理（学坏了），'
+                              f'已重设为 k = {learn.K_DEFAULT}、b = {learn.B_DEFAULT}，会重新校准')
+            self.cfg.update(k=learn.K_DEFAULT, b=learn.B_DEFAULT, k_side=0, k_foot=0, calib_since=time.time())
+            jb.save_config(self.cfg)
         self.build()
         self.root.after(50, self.poll)
         self.root.after(100, self.start)
@@ -190,6 +196,7 @@ class App:
         btn(lr, '清除学习', self.clear_learn, font=FONT).pack(side='left', padx=6)
         self.export_btn = btn(lr, '📦 导出数据', self.export_data, bg='#2f6f9f', fg='#fff', font=FONT)
         self.export_btn.pack(side='left')
+        btn(c, '🔧 我调整了装置（换了角度等）', self.device_changed, font=FONT).pack(fill='x', pady=(6, 0))
 
         # 落点误差图
         c = card(colB, '🎯 落点误差（最近 30 跳，绿 = ±3% 内，黄框 = 故意偏离）')
@@ -396,7 +403,7 @@ class App:
         if err or err_msg:
             self.status(str(err or err_msg), 'err'); return
         self.refresh()
-        self.status(f'截图方式：{jb.SCREENCAP_INFO}', 'ok')
+        self.status(self.reset_msg or f'截图方式：{jb.SCREENCAP_INFO}', 'warn' if self.reset_msg else 'ok')
 
     def grab_stable(self, tries=8):
         """等画面停下来（镜头还在移动时，跳跃方向会是歪的）：连拍两张差不多才算。"""
@@ -713,35 +720,37 @@ class App:
         self.status('落点：' + msg, 'ok' if abs(pct) < 3 else 'warn')
 
     def calibrate(self, rec, jump):
-        f = learn.fit_land(self.store)
-        extra = {}
-        if f and f['rms'] < 30:
-            k, b = round(f['k'], 4), round(f['b'])
-            extra = {'k_side': round(f['k_side'], 1), 'k_foot': round(f['k_foot'], 1), 'foot0': round(f['foot0'], 4)}
-            terms = {'base': '', 'side': ' + 左右修正', 'side+foot': ' + 左右修正 + 高度修正'}[f['terms']]
-            how = f'（{f["n"]} 跳拟合{terms}，误差 ±{f["rms"]:.0f} ms）'
+        if learn.bias_alarm(self.store, self.cfg):
+            # 连续几跳都偏同一边：装置可能变了（例如换了按压角度）→ 只用最近的资料重新校准
+            self.cfg['calib_since'] = self.store.recs[-5].get('t_press') or time.time()
+            self.store.event('bias_alarm', since=self.cfg['calib_since'])
+            jb.save_config(self.cfg)
+            alarm = '⚠ 连续 5 跳都偏同一边，装置可能变了，重新校准；'
         else:
-            # 资料还不够：用这一跳单独修 k（只修一部分，避免一次量错就乱掉）
-            traveled = rec['land']['traveled']
-            if traveled < 50:
-                return ''
-            corr = (self.cfg.get('k_side', 0) * learn._jump_side(rec)
-                    + self.cfg.get('k_foot', 0) * (rec['a'][1] - self.cfg.get('foot0', rec['a'][1])))
-            k_true = (rec['ms'] - self.cfg['b'] - corr) / traveled
-            k = round(max(0.01, self.cfg['k'] + 0.6 * (k_true - self.cfg['k'])), 4)
-            b = self.cfg['b']
-            how = '（单跳修正）'
-        if k == self.cfg['k'] and b == self.cfg['b'] and all(self.cfg.get(x) == v for x, v in extra.items()):
-            return ''
-        self.store.event('calibrate', k_old=self.cfg['k'], b_old=self.cfg['b'], k=k, b=b, how=how, **extra)
-        self.cfg['k'], self.cfg['b'] = k, b
-        self.cfg.update(extra)
+            alarm = ''
+        new, how = learn.calibration_update(self.store, self.cfg, rec)
+        if not new or all(self.cfg.get(x) == v for x, v in new.items()):
+            return (' ' + alarm) if alarm else ''
+        self.store.event('calibrate', k_old=self.cfg['k'], b_old=self.cfg['b'], how=how, **new)
+        self.cfg.update(new)
         jb.save_config(self.cfg)
         for e, key in ((self.e_k, 'k'), (self.e_b, 'b')):
             e.delete(0, 'end'); e.insert(0, str(self.cfg[key]))
         self.recalc()
         side_txt = f'，右上 {self.cfg["k_side"]:+.0f} ms' if self.cfg.get('k_side') else ''
-        return f' → k = {k}, b = {b}{side_txt}{how}'
+        return f' {alarm}→ k = {self.cfg["k"]}, b = {self.cfg["b"]}{side_txt}{how}'
+
+    def device_changed(self):
+        """你调整了装置（例如换了按压角度）：之前的落点资料不再拿来校准，用新的资料快速重学。"""
+        self.cfg['calib_since'] = time.time()
+        if not learn.sane_calibration(self.cfg):
+            self.cfg.update(k=learn.K_DEFAULT, b=learn.B_DEFAULT, k_side=0, k_foot=0)
+        jb.save_config(self.cfg)
+        self.store.event('device_changed', k=self.cfg['k'], b=self.cfg['b'])
+        for e, key in ((self.e_k, 'k'), (self.e_b, 'b')):
+            e.delete(0, 'end'); e.insert(0, str(self.cfg[key]))
+        self.recalc(); self.update_learn()
+        self.status('🔧 已标记：装置调整过。接下来几跳会快速重新校准（先修 b，资料够了再一起修 k）', 'ok')
 
     def update_learn(self):
         recs = self.store.recs
