@@ -370,14 +370,23 @@ def find_face(img, fx, fy, angle_deg, Wn):
     found = []
     for side in (1, -1):
         ux, uy = side * math.cos(t), -math.sin(t)
+        first, best = None, None
         for s in range(2, int(1.3 * Wn)):
+            if first is not None and s > first + 0.25 * Wn:
+                break
             x, y = int(round(fx + ux * s)), int(round(fy + uy * s))
             if not (0 <= x < Wn and 0 <= y < Hn):
                 break
             L = int(lab[y, x])
             if L and L not in cur and sizes[L] >= min_area and is_face(L):
-                found.append((s, side, L))
-                break
+                # 第一块碰到的可能是方块前面的装饰（例如炸鸡盘前面的荷包蛋，颜色跟顶面一样）；
+                # 再往前看一小段，选最大的那一块才是真正的顶面
+                if first is None:
+                    first = s
+                if best is None or sizes[L] > sizes[best[1]]:
+                    best = (first, L)
+        if best:
+            found.append((best[0], side, best[1]))
     if not found:
         return None
     s, side, L = min(found)
