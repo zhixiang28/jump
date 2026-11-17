@@ -286,12 +286,25 @@ def find_face(img, fx, fy, angle_deg, Wn):
         return None
     s, side, L = min(found)
     ys, xs = np.nonzero((lab == L) & cream)
-    cx, cy = float(xs.mean()), float(ys.mean())
     w = float(xs.max() - xs.min() + 1)
+    if (ys.max() - ys.min() + 1) / w > 0.7:
+        # 比正常顶面（高÷宽 ≈ 0.5）高很多：连到了同颜色的墙壁 → 用左右端点算中心
+        cx, cy = map(float, face_center_extremes(ys, xs))
+    else:
+        cx, cy = float(xs.mean()), float(ys.mean())          # 完整的顶面：直接取重心
     if w < 0.12 * Wn or (cx - fx) * side <= 0 or cy >= fy:
         return None
     return {'center': (cx / Wn, cy / Wn), 'top': (cx / Wn, ys.min() / Wn), 'side': side, 'width': w / Wn,
             'method': 'face'}
+
+
+def face_center_extremes(ys, xs):
+    """顶面中心 = 最左、最右两点的中点。菱形 / 椭圆的左右端点都在中心高度；
+    每一列取「最高」的那一点，这样下面同颜色的墙壁、被小人挡住的部分都不影响。"""
+    xl, xr = xs.min(), xs.max()
+    yl = ys[xs <= xl + 1].min()
+    yr = ys[xs >= xr - 1].min()
+    return (xl + xr) / 2, (yl + yr) / 2
 
 
 def cream_mask(img):
@@ -316,10 +329,8 @@ def standing_face(im, foot):
     ys, xs = np.nonzero(m)
     if xs.max() - xs.min() < 0.15 * Wn or (ys.max() - ys.min()) / (xs.max() - xs.min()) > 0.9:
         return None
-    xl, xr = xs.min(), xs.max()
-    yl = ys[xs <= xl + 1].mean()
-    yr = ys[xs >= xr - 1].mean()
-    return {'center': ((xl + xr) / 2 / Wn, (yl + yr) / 2 / Wn), 'width': (xr - xl) / Wn}
+    cx, cy = face_center_extremes(ys, xs)
+    return {'center': (cx / Wn, cy / Wn), 'width': (xs.max() - xs.min()) / Wn}
 
 
 def landing(im, tpls, jump):

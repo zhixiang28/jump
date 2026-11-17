@@ -82,8 +82,25 @@ class App:
         self.cv.bind('<ButtonRelease-1>', self.on_up)
         self.cv.bind('<Button-3>', lambda e: self.clear_line())
 
-        p = tk.Frame(r, bg=PANEL, padx=12, pady=10)
-        p.pack(side='left', fill='y', padx=(4, 8), pady=8)
+        # 右边面板放在可以捲动的区域里：笔电萤幕比较矮也看得到全部（滑鼠滚轮捲动）
+        outer = tk.Frame(r, bg=PANEL)
+        outer.pack(side='left', fill='y', padx=(4, 8), pady=8)
+        pcv = tk.Canvas(outer, bg=PANEL, highlightthickness=0, height=self.max_h, width=360)
+        sb = tk.Scrollbar(outer, orient='vertical', command=pcv.yview)
+        pcv.configure(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y')
+        pcv.pack(side='left', fill='y')
+        p = tk.Frame(pcv, bg=PANEL, padx=12, pady=10)
+        pcv.create_window((0, 0), window=p, anchor='nw')
+        p.bind('<Configure>', lambda e: pcv.configure(scrollregion=pcv.bbox('all'), width=p.winfo_reqwidth()))
+
+        def wheel(e):
+            d = -1 if (getattr(e, 'num', 0) == 4 or e.delta > 0) else 1
+            pcv.yview_scroll(d * 2, 'units')
+        outer.bind('<Enter>', lambda e: (pcv.bind_all('<MouseWheel>', wheel), pcv.bind_all('<Button-4>', wheel),
+                                         pcv.bind_all('<Button-5>', wheel)))
+        outer.bind('<Leave>', lambda e: (pcv.unbind_all('<MouseWheel>'), pcv.unbind_all('<Button-4>'),
+                                         pcv.unbind_all('<Button-5>')))
 
         def btn(parent, text, cmd, bg='#262a31', fg=TEXT, **kw):
             b = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
@@ -108,6 +125,12 @@ class App:
         btn(fb, '− 太久 (1)', lambda: self.feedback(-1), bg='#d9472f', fg='#fff').pack(side='left', fill='x', expand=True)
         btn(fb, '✓ 刚好 (2)', self.ok, bg='#1fa955', fg='#fff').pack(side='left', fill='x', expand=True, padx=6)
         btn(fb, '＋ 太短 (3)', lambda: self.feedback(1), bg='#d58f12', fg='#fff').pack(side='left', fill='x', expand=True)
+
+        self.v_play = tk.BooleanVar(value=False)
+        self.play_btn = btn(p, '🤖 AI 自动玩 (A)', self.toggle_play_btn, bg='#7b3fe4', fg='#fff',
+                            font=('Microsoft YaHei UI', 14, 'bold'))
+        self.play_btn.pack(fill='x', pady=(8, 0))
+        self.v_play.trace_add('write', lambda *a: self.sync_play_btn())
 
         self.st = tk.Label(p, text='', font=FONT, bg=PANEL, fg=SUB, wraplength=330, justify='left', height=3, anchor='nw')
         self.st.pack(fill='x', pady=(10, 4))
@@ -156,10 +179,6 @@ class App:
         tk.Checkbutton(lf, text='跳完自动量落点、校准 k/b', variable=self.v_calib, command=on_calib, font=FONT,
                        bg='#24272e', fg=TEXT, selectcolor='#262a31', activebackground='#24272e',
                        activeforeground=TEXT, anchor='w').pack(fill='x', pady=(4, 0))
-        self.v_play = tk.BooleanVar(value=False)
-        tk.Checkbutton(lf, text='AI 自动玩（Esc 停止）', variable=self.v_play, command=self.toggle_play, font=FONT_B,
-                       bg='#24272e', fg='#e9a0ff', selectcolor='#262a31', activebackground='#24272e',
-                       activeforeground='#e9a0ff', anchor='w').pack(fill='x', pady=(4, 0))
 
         tk.Label(p, text='', bg=PANEL).pack()
         self.e_k = entry('k', 'k')
@@ -167,7 +186,7 @@ class App:
         self.e_ang = entry('跳跃角度 (°)', 'jump_angle_deg')
         self.e_wait = entry('按完等几秒', 'wait_after')
         tk.Label(p, text='按压时间 = 距离 × k + b\n距离单位：手机屏幕宽 = 1000\n'
-                         '\n空白键 按 · R 截图 · 右键 清除线\n1 太久 · 2 刚好 · 3 太短',
+                         '\n空白键 按 · R 截图 · 右键 清除线\n1 太久 · 2 刚好 · 3 太短\nA AI 自动玩 · Esc 停止',
                  font=('Microsoft YaHei UI', 10), bg=PANEL, fg=SUB, justify='left').pack(anchor='w', pady=(10, 0))
         self.info_lbl = tk.Label(p, text='', font=('Microsoft YaHei UI', 10), bg=PANEL, fg=SUB, justify='left')
         self.info_lbl.pack(anchor='w', pady=(6, 0))
@@ -191,6 +210,8 @@ class App:
         elif k in ('1', 'kp_1'): self.feedback(-1)
         elif k in ('2', 'kp_2'): self.ok()
         elif k in ('3', 'kp_3'): self.feedback(1)
+        elif k == 'a':
+            self.toggle_play_btn()
         elif k == 'escape' and self.v_play.get():
             self.v_play.set(False); self.status('⏸ AI 自动玩已停止', 'warn')
 
@@ -587,6 +608,15 @@ class App:
             return
         self.store.clear(); self.tpls = []; self.pred = None
         self.draw(); self.update_learn(); self.status('学习纪录已清除', 'ok')
+
+    def toggle_play_btn(self):
+        self.v_play.set(not self.v_play.get())
+        self.toggle_play()
+
+    def sync_play_btn(self):
+        on = self.v_play.get()
+        self.play_btn.config(text='⏸ 停止 AI（A / Esc）' if on else '🤖 AI 自动玩 (A)',
+                             bg='#d9472f' if on else '#7b3fe4', activebackground='#d9472f' if on else '#7b3fe4')
 
     def toggle_play(self):
         if not self.v_play.get():
