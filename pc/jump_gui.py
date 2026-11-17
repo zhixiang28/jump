@@ -7,7 +7,7 @@
 
 快捷键：
   空白键 = 按       R = 重新截图       右键 = 清除线
-  1 = 太久          2 = 刚好           3 = 太短         Esc = 停止 AI 自动玩
+  1 = 跳太远        2 = 刚好           3 = 跳太近         Esc = 停止 AI 自动玩
 
 学习：你每画一条线按一次，都会记下来（pc/data/）。AI 会学小人的样子、跳跃角度和 k/b，
      并在你玩的时候偷偷预测（紫色虚线），跟你画的比较；够准了再打开「AI 自动玩」。
@@ -152,9 +152,9 @@ class App:
                              font=('Microsoft YaHei UI', 18, 'bold'))
         self.press_btn.pack(fill='x', pady=(12, 8))
         fb = tk.Frame(c, bg=CARD); fb.pack(fill='x')
-        btn(fb, '− 太久 (1)', lambda: self.feedback(-1), bg='#d9472f', fg='#fff').pack(side='left', fill='x', expand=True)
+        btn(fb, '跳太远 (1)', lambda: self.feedback(-1), bg='#d9472f', fg='#fff').pack(side='left', fill='x', expand=True)
         btn(fb, '✓ 刚好 (2)', self.ok, bg='#1fa955', fg='#fff').pack(side='left', fill='x', expand=True, padx=6)
-        btn(fb, '＋ 太短 (3)', lambda: self.feedback(1), bg='#d58f12', fg='#fff').pack(side='left', fill='x', expand=True)
+        btn(fb, '跳太近 (3)', lambda: self.feedback(1), bg='#d58f12', fg='#fff').pack(side='left', fill='x', expand=True)
         self.v_play = tk.BooleanVar(value=False)
         self.play_btn = btn(c, '🤖 AI 自动玩 (A)', self.toggle_play_btn, bg='#7b3fe4', fg='#fff',
                             font=('Microsoft YaHei UI', 15, 'bold'))
@@ -247,7 +247,7 @@ class App:
         self.info_lbl.pack(anchor='w', pady=(6, 0))
         tk.Label(c, text='按压时间 = 距离 × k + b（距离：手机屏幕宽 = 1000）\n\n'
                          '快捷键：空白键 按 · R 截图 · 右键 清除线\n'
-                         '1 太久 · 2 刚好 · 3 太短 · A AI 自动玩 · Esc 停止',
+                         '1 跳太远 · 2 刚好 · 3 跳太近 · A AI 自动玩 · Esc 停止',
                  font=('Microsoft YaHei UI', 10), bg=CARD, fg=SUB, justify='left').pack(anchor='w', pady=(8, 0))
 
         self.show_info()
@@ -625,7 +625,7 @@ class App:
             return
         if self.cur_rec is not None and self.cur_rec.get('ms') == ms:
             self.cur_rec['t_done'] = round(time.time(), 3)      # ESP 回报按完的时间
-        self.status(f'已按 {ms} ms ✓ 等画面停下来量落点…（也可以按 1 太久 / 2 刚好 / 3 太短）', 'ok')
+        self.status(f'已按 {ms} ms ✓ 等画面停下来量落点…（也可以按 1 跳太远 / 2 刚好 / 3 跳太近）', 'ok')
 
         def done():
             self.busy = False; self.press_btn.config(state='normal')
@@ -635,7 +635,7 @@ class App:
     # ------------------------------------------------------------ 校准
     def feedback(self, d):
         if not self.last:
-            self.status('先画线按一次，再告诉我太久还是太短', 'warn'); return
+            self.status('先画线按一次，再告诉我跳太远还是跳太近', 'warn'); return
         if self.last_dir and d != self.last_dir:
             self.cfg['step'] = max(0.005, self.cfg['step'] / 2)
         self.last_dir = d
