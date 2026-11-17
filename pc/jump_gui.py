@@ -364,13 +364,19 @@ class App:
             messagebox.showerror('找不到 adb', '找不到 adb.exe。\n请下载 SDK Platform-Tools 解压到 C:\\platform-tools，'
                                  '或在 jump_config.json 的 "adb" 写完整路径。')
             return
-        self.bg(lambda: jb.check_device(self.adb), self.after_check)
+        def check():
+            err = jb.check_device(self.adb)
+            if not err:
+                jb.pick_screencap_mode(self.adb)       # 测一下哪种截图方式比较快
+            return err
+        self.bg(check, self.after_check)
         self.live_tick()
 
     def after_check(self, err_msg, err):
         if err or err_msg:
             self.status(str(err or err_msg), 'err'); return
         self.refresh()
+        self.status(f'截图方式：{jb.SCREENCAP_INFO}', 'ok')
 
     def grab_stable(self, tries=8):
         """等画面停下来（镜头还在移动时，跳跃方向会是歪的）：连拍两张差不多才算。"""
@@ -378,7 +384,7 @@ class App:
             return np.asarray(im.convert('L').resize((60, 132)), dtype=np.float32)
         a = jb.screenshot(self.adb)
         for _ in range(tries):
-            time.sleep(0.35)
+            time.sleep(0.25)
             b = jb.screenshot(self.adb)
             if float(np.abs(small(a) - small(b)).mean()) < 3.0:   # 雪花在飘只会差一点点
                 return b
@@ -618,8 +624,9 @@ class App:
         pend, self.pending = self.pending, None
 
         def work():
-            land = learn.landing(img, tpls, pend[0]) if pend else None
-            return learn.predict(img, tpls, self.cfg, self.store), land
+            ch = learn.find_char(img, tpls)            # 小人只找一次，量落点和预测共用
+            land = learn.landing(img, tpls, pend[0], ch=ch) if pend else None
+            return learn.predict(img, tpls, self.cfg, self.store, ch=ch), land
         self.bg(work, lambda res, err: self.after_pred(img, res, err, pend))
 
     def after_pred(self, img, res, err, pend=None):

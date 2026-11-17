@@ -170,20 +170,53 @@ def half(arr):
                       dtype=np.float64)
 
 
-def find_char(im, tpls):
-    """回传 {'foot': (x, y) 屏宽比例, 'score'} 或 None。先在宽 270 找，再到 540 细调。"""
+_TPL_FFT = {}       # 样板的 FFT 快取：(样板, 搜寻区大小) → (共轭频谱, 高, 宽, 范数)
+
+
+def _tpl_fft(T, shape):
+    key = (id(T), shape)
+    hit = _TPL_FFT.get(key)
+    if hit is None:
+        if len(_TPL_FFT) > 64:
+            _TPL_FFT.clear()
+        t = T['half']
+        tz = t - t.mean()
+        tn = math.sqrt(float((tz ** 2).sum()))
+        Gs = [np.conj(np.fft.rfft2(tz[..., c], shape)) for c in range(3)]
+        hit = (Gs, t.shape[0], t.shape[1], tn)
+        _TPL_FFT[key] = hit
+    return hit
+
+
+def find_char(im, tpls, y_range=(0.38, 0.85)):
+    """回传 {'foot': (x, y) 屏宽比例, 'score'} 或 None。先在宽 270 找，再到 540 细调。
+    加速：小人只会在画面中间偏下，只搜那一段；整张图的 FFT 只算一次，所有样板共用；样板的 FFT 也快取。"""
     if not tpls:
         return None
     small = as_arr(im, NW // 2)
+    H = small.shape[0]
+    ya, yb = int(H * y_range[0]), int(H * y_range[1])
+    reg = small[ya:yb]
+    Hr, Wr = reg.shape[:2]
+    F = [np.fft.rfft2(reg[..., c]) for c in range(3)]
+    cS = np.pad(reg.sum(2).cumsum(0).cumsum(1), ((1, 0), (1, 0)))
+    cSS = np.pad((reg ** 2).sum(2).cumsum(0).cumsum(1), ((1, 0), (1, 0)))
     best = None
     for i, T in enumerate(tpls):
-        m = ncc_map(small, half(T['t']))
-        if m is None:
+        if 'half' not in T:
+            T['half'] = half(T['t'])
+        Gs, h, w, tn = _tpl_fft(T, (Hr, Wr))
+        if h > Hr or w > Wr or tn < 1e-6:
             continue
+        num = np.fft.irfft2(F[0] * Gs[0] + F[1] * Gs[1] + F[2] * Gs[2], (Hr, Wr))[:Hr - h + 1, :Wr - w + 1]
+        n = h * w * 3
+        s1 = cS[h:, w:] - cS[:-h, w:] - cS[h:, :-w] + cS[:-h, :-w]
+        s2 = cSS[h:, w:] - cSS[:-h, w:] - cSS[h:, :-w] + cSS[:-h, :-w]
+        m = num / (np.sqrt(np.maximum(s2 - s1 * s1 / n, 1e-6)) * tn)
         y, x = np.unravel_index(int(np.argmax(m)), m.shape)
         sc = float(m[y, x])
         if best is None or sc > best[0]:
-            best = (sc, x, y, i)
+            best = (sc, x, y + ya, i)
     if best is None:
         return None
     _, x, y, i = best
@@ -333,10 +366,10 @@ def standing_face(im, foot):
     return {'center': (cx / Wn, cy / Wn), 'width': (xs.max() - xs.min()) / Wn}
 
 
-def landing(im, tpls, jump):
+def landing(im, tpls, jump, ch=None):
     """跳完之后量落点。jump = {'dir': (ux, uy) 跳跃方向单位向量, 'units': 原本要跳的距离}。
     回传 {'err': 沿跳跃方向偏了多少（+ 跳过头 / − 不够远，屏宽=1000）, 'traveled': 实际跳的距离}，量不到回传 None。"""
-    ch = find_char(im, tpls)
+    ch = ch or find_char(im, tpls)
     if not ch or ch['score'] < 0.55:
         return {'lost': True}                           # 找不到小人：可能掉下去了
     face = standing_face(im, ch['foot'])
@@ -503,9 +536,9 @@ def learned_angle(store, n=20):
     return float(np.median(angs)) if len(angs) >= 5 else None
 
 
-def predict(im, tpls, cfg, store, char_thr=0.55):
-    """回传预测 dict（失败时 'err' 说明原因）。"""
-    ch = find_char(im, tpls)
+def predict(im, tpls, cfg, store, char_thr=0.55, ch=None):
+    """回传预测 dict（失败时 'err' 说明原因）。ch：已经找过的小人（省一次）。"""
+    ch = ch or find_char(im, tpls)
     if not ch:
         return {'err': '还没有小人模板（先自己画线玩几跳）'}
     if ch['score'] < char_thr:
