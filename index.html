@@ -1,102 +1,137 @@
 <!DOCTYPE html>
 <html lang="zh"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no,viewport-fit=cover">
+<meta name="theme-color" content="#0e0f12">
 <title>Servo Press · 相机测距</title>
 <style>
-  *{box-sizing:border-box}
-  body{margin:0;font-family:system-ui;background:#111;color:#eee}
-  header{display:flex;align-items:center;gap:8px;padding:10px 12px}
-  header b{flex:1;font-size:17px}
-  button{border:0;border-radius:10px;padding:10px 14px;font-size:16px;background:#2d6cdf;color:#fff}
-  button.sec{background:#333}
-  button.on{background:#2a9d55}
-  button:active{transform:scale(.96)}
-  button:disabled{opacity:.4}
-  #wrap{position:relative;width:100%;background:#000;touch-action:none;min-height:120px}
-  video{width:100%;display:block}
+  :root{
+    --bg:#0e0f12; --panel:#1a1c21; --panel2:#262a31; --line:#3a3f48;
+    --text:#f3f4f6; --sub:#c0c5cd;
+    --blue:#3b7cff; --green:#1fa955; --red:#d9472f; --amber:#d58f12;
+    --cyan:#33d6ff; --yellow:#ffd83a;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;background:var(--bg);color:var(--text);
+    font-family:system-ui,-apple-system,"PingFang SC","Noto Sans SC",sans-serif;-webkit-text-size-adjust:100%}
+  body{padding-bottom:var(--dockH,200px)}
+
+  button{font:inherit;font-size:16px;font-weight:600;border:0;border-radius:12px;padding:10px 14px;min-height:46px;
+    background:var(--blue);color:#fff;cursor:pointer;touch-action:manipulation;
+    transition:transform .08s,opacity .15s,background-color .15s}
+  button:active{transform:scale(.95)}
+  button.sec{background:var(--panel2);color:var(--text);border:1px solid var(--line)}
+  button.on{background:var(--green);color:#fff;border-color:transparent}
+  button.dim{background:#2a2d34 !important;color:#9aa0a9 !important;box-shadow:none !important;border:1px solid var(--line)}
+
+  /* ---------- 顶部 ---------- */
+  header{display:flex;align-items:center;gap:8px;padding:calc(8px + env(safe-area-inset-top)) 12px 8px}
+  header b{flex:1;font-size:18px;white-space:nowrap}
+  header button{padding:8px 12px;min-height:40px;font-size:15px}
+
+  #tipbar{display:flex;align-items:center;gap:10px;margin:0 12px 8px;padding:10px 12px;border-radius:12px;
+    background:var(--panel);border:1px solid var(--line);font-size:16px;line-height:1.35;min-height:48px}
+  #stepNo{flex:none;width:28px;height:28px;border-radius:50%;background:var(--yellow);color:#000;
+    display:grid;place-items:center;font-weight:800;font-size:15px}
+  #tip{flex:1}
+
+  /* ---------- 相机画面 ---------- */
+  #stage{display:flex;justify-content:center}
+  #wrap{position:relative;background:#000;touch-action:none;overflow:hidden;border-radius:12px;
+    width:100%;height:240px;user-select:none;-webkit-user-select:none}
+  video{position:absolute;inset:0;width:100%;height:100%;object-fit:fill;display:block}
   canvas{position:absolute;inset:0;width:100%;height:100%}
-  #tip{position:absolute;left:8px;top:8px;right:8px;background:#000a;padding:6px 10px;border-radius:8px;font-size:15px;pointer-events:none}
-  .modes{display:flex;gap:8px;padding:10px 12px 0}
-  .modes button{flex:1}
-  #big{display:flex;align-items:center;justify-content:space-between;padding:12px}
-  #ms{font-size:40px;font-weight:700;line-height:1.1}
-  #ms small{font-size:15px;color:#aaa;font-weight:400}
-  #press{font-size:22px;padding:16px 26px}
-  .fb{display:flex;gap:8px;padding:0 12px}
-  .fb button{flex:1;padding:14px 6px;font-size:17px}
-  #less{background:#b5462f} #more{background:#b5892f} #ok{background:#2a9d55}
-  #st{padding:8px 12px 0;color:#7c7;min-height:24px}
-  .card{background:#1d1d1d;border-radius:12px;padding:12px;margin:10px 12px}
-  .row{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}
-  input[type=number]{width:90px;font-size:17px;padding:8px;border-radius:8px;border:0}
-  label{font-size:15px}
-  summary{font-weight:700}
-  small.g{color:#888}
-  .ang{display:flex;align-items:center;gap:6px;margin:10px 0}
-  .ang span{width:34px;font-size:15px}
-  .ang input[type=range]{flex:1;accent-color:#2d6cdf;height:28px}
-  .ang input[type=number]{width:62px}
-  .pm{padding:8px 12px;font-size:18px}
+  #camBig{position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);font-size:19px;padding:16px 26px}
+  #camBig:active{transform:translate(-50%,-50%) scale(.95)}
+
+  .modes{display:flex;gap:8px;padding:8px 12px 0}
+  .modes button{flex:1;padding:8px 6px;font-size:15px}
+  .modes #clr{flex:0 0 auto}
+
+  /* ---------- 底部操作区（固定） ---------- */
+  #dock{position:fixed;left:0;right:0;bottom:0;z-index:10;background:#121317;
+    border-top:1px solid var(--line);padding:8px 12px calc(10px + env(safe-area-inset-bottom));
+    box-shadow:0 -6px 20px #0008}
+  #st{font-size:15px;min-height:21px;line-height:1.4;color:var(--sub);margin-bottom:6px;
+    white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  #st.ok{color:#5fe08f} #st.warn{color:#ffc14d} #st.err{color:#ff7b66}
+  .drow{display:flex;align-items:center;gap:12px}
+  #ms{flex:1;min-width:0}
+  #msN{font-size:44px;font-weight:800;line-height:1;font-variant-numeric:tabular-nums}
+  #ms .u{font-size:17px;color:var(--sub);font-weight:600;margin-left:4px}
+  #dist{font-size:14px;color:var(--sub);margin-top:4px}
+  #press{font-size:24px;font-weight:800;padding:0 28px;min-height:68px;border-radius:16px;
+    box-shadow:0 4px 14px #3b7cff55}
+  .fb{display:flex;gap:8px;margin-top:10px}
+  .fb button{flex:1;padding:10px 4px;font-size:16px;min-height:52px;line-height:1.15}
+  .fb small{display:block;font-size:12px;font-weight:500;opacity:.9}
+  #less{background:var(--red)} #more{background:var(--amber)} #ok{background:var(--green)}
+
+  /* ---------- 设定卡片 ---------- */
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:14px;margin:12px}
+  .card h3{margin:0 0 4px;font-size:17px}
+  .row{display:flex;gap:10px;align-items:center;margin:10px 0;flex-wrap:wrap}
+  label{font-size:16px;display:flex;align-items:center;gap:8px}
+  input[type=number]{width:96px;font-size:17px;padding:9px 10px;border-radius:10px;
+    border:1px solid var(--line);background:#0b0c0f;color:var(--text)}
+  summary{font-weight:700;font-size:17px;padding:4px 0;cursor:pointer}
+  .hint{color:var(--sub);font-size:14px;line-height:1.45}
+
+  .sw{gap:12px;cursor:pointer}
+  .sw input{appearance:none;-webkit-appearance:none;flex:none;width:52px;height:30px;border-radius:15px;
+    background:#4a4f58;position:relative;transition:background .2s;margin:0}
+  .sw input::after{content:"";position:absolute;top:3px;left:3px;width:24px;height:24px;border-radius:50%;
+    background:#fff;transition:left .2s}
+  .sw input:checked{background:var(--green)}
+  .sw input:checked::after{left:25px}
+
+  .ang{display:flex;align-items:center;gap:8px;margin:12px 0}
+  .ang span{width:38px;font-size:16px;font-weight:600}
+  .ang input[type=number]{width:66px;text-align:center}
+  .pm{padding:0;width:44px;min-height:44px;font-size:22px}
+  input[type=range]{-webkit-appearance:none;appearance:none;flex:1;min-width:60px;height:8px;border-radius:4px;
+    background:var(--line);margin:0}
+  input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;width:30px;height:30px;border-radius:50%;
+    background:var(--blue);border:3px solid #fff}
+  input[type=range]::-moz-range-thumb{width:24px;height:24px;border-radius:50%;background:var(--blue);border:3px solid #fff}
+  .btns{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:6px}
+  .btns button{font-size:15px}
+
+  @media (max-height:520px){
+    #msN{font-size:32px} #press{min-height:54px;font-size:20px}
+    .fb button{min-height:44px} .fb small{display:none}
+  }
 </style></head><body>
 
 <header>
   <b>Servo Press</b>
-  <button id="cam" class="sec">开相机</button>
+  <button id="cam" class="sec">📷 开相机</button>
   <button id="conn">连接蓝牙</button>
 </header>
 
-<div id="wrap">
-  <video id="v" playsinline muted autoplay></video><canvas id="c"></canvas>
-  <div id="tip">先开相机</div>
-</div>
+<div id="tipbar"><span id="stepNo">1</span><span id="tip">先开相机，对准手机屏幕</span></div>
 
-<div class="modes">
-  <button id="mFrame" class="sec">① 画手机边框</button>
-  <button id="mLine" class="sec">② 画距离</button>
-</div>
-
-<div id="big">
-  <div id="ms">— <small>ms</small><br><small id="dist">&nbsp;</small></div>
-  <button id="press">按！</button>
-</div>
-
-<div class="fb">
-  <button id="less">按太久 −</button>
-  <button id="ok">刚好 ✓</button>
-  <button id="more">按太短 +</button>
-</div>
-<div id="st"></div>
-
-<div class="card">
-  <div class="row">
-    <label><input id="auto" type="checkbox"> 画完自动按</label>
+<div id="stage">
+  <div id="wrap">
+    <video id="v" playsinline muted autoplay></video><canvas id="c"></canvas>
+    <button id="camBig">📷 开相机</button>
   </div>
-  <small class="g" id="info"></small>
+</div>
+
+<div class="modes" id="modes">
+  <button id="mFrame" class="sec">① 边框</button>
+  <button id="mLine" class="sec">② 距离</button>
+  <button id="clr" class="sec">↺ 重画边框</button>
 </div>
 
 <div class="card">
-  <details>
-    <summary>进阶设定</summary>
-    <div class="row">
-      <label>屏幕比例 (高÷宽) <input id="ar" type="number" step="0.01"></label>
-    </div>
-    <div class="row">
-      <label>k <input id="k" type="number" step="0.01"></label>
-      <label>b (ms) <input id="b" type="number" step="10"></label>
-      <button class="sec" id="resetStep">重置调整幅度</button>
-    </div>
-    <small class="g">按压时间 = 距离 × k + b。距离单位：手机屏幕宽 = 1000。</small>
-    <div class="row">
-      <input id="manual" type="number" placeholder="手动 ms">
-      <button class="sec" id="go">手动按</button>
-    </div>
-  </details>
+  <label class="sw"><input id="auto" type="checkbox"> 画完自动按</label>
+  <div class="hint" id="info" style="margin-top:8px"></div>
 </div>
 
 <div class="card">
-  <b>Servo 角度</b>
-  <small class="g">（拖动时 servo 会跟着转，调好按保存）</small>
+  <h3>Servo 角度</h3>
+  <div class="hint">拖动时 servo 会跟着转，调好按「保存」</div>
   <div class="ang">
     <span>静止</span>
     <button class="sec pm" data-t="ra" data-d="-1">−</button>
@@ -111,13 +146,45 @@
     <button class="sec pm" data-t="pa" data-d="1">＋</button>
     <input id="pa" type="number" min="0" max="180">
   </div>
-  <div class="row">
+  <div class="btns">
     <button class="sec" id="toRest">去静止位</button>
     <button class="sec" id="toPush">去压下位</button>
     <button class="sec" id="tryP">试按 300ms</button>
-    <button id="saveA">保存</button>
+    <button id="saveA">保存到板子</button>
   </div>
-  <small class="g" id="angSt">未连接时显示的是上次保存的值</small>
+  <div class="hint" id="angSt" style="margin-top:10px">未连接时显示的是上次保存的值</div>
+</div>
+
+<div class="card">
+  <details>
+    <summary>进阶设定</summary>
+    <div class="row">
+      <label>屏幕比例 (高÷宽) <input id="ar" type="number" step="0.01" inputmode="decimal"></label>
+    </div>
+    <div class="row">
+      <label>k <input id="k" type="number" step="0.01" inputmode="decimal"></label>
+      <label>b (ms) <input id="b" type="number" step="10" inputmode="numeric"></label>
+    </div>
+    <div class="row"><button class="sec" id="resetStep">重置调整幅度</button></div>
+    <div class="hint">按压时间 = 距离 × k + b。距离单位：手机屏幕宽 = 1000。</div>
+    <div class="row">
+      <input id="manual" type="number" placeholder="手动 ms" inputmode="numeric">
+      <button class="sec" id="go">手动按</button>
+    </div>
+  </details>
+</div>
+
+<div id="dock">
+  <div id="st">&nbsp;</div>
+  <div class="drow">
+    <div id="ms"><span id="msN">--</span><span class="u">ms</span><div id="dist">还没画线</div></div>
+    <button id="press">按！</button>
+  </div>
+  <div class="fb">
+    <button id="less">− 太久<small>跳过头了</small></button>
+    <button id="ok">✓ 刚好<small>收窄幅度</small></button>
+    <button id="more">＋ 太短<small>没跳到</small></button>
+  </div>
 </div>
 
 <script>
@@ -125,17 +192,18 @@ const SVC='6e400001-b5a3-f393-e0a9-e50e24dcca9e',
       RX ='6e400002-b5a3-f393-e0a9-e50e24dcca9e',
       TX ='6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 const $=id=>document.getElementById(id);
-const v=$('v'), c=$('c'), ctx=c.getContext('2d');
+const v=$('v'), c=$('c'), ctx=c.getContext('2d'), wrap=$('wrap');
 const store={get(k,d){try{const x=localStorage.getItem('sp_'+k);return x===null?d:JSON.parse(x)}catch{return d}},
              set(k,x){try{localStorage.setItem('sp_'+k,JSON.stringify(x))}catch{}}};
-const st=t=>$('st').textContent=t;
+function st(t,kind=''){const e=$('st');e.textContent=t||' ';e.className=kind}
 
 // ---------- 状态 ----------
 let rx=null;
 let mode='frame';
 let corners=store.get('corners',[]);   // 归一化画面坐标 [{x,y}] ×4：左上 右上 右下 左下
 let H=null;                            // 画面 → 手机屏幕坐标 的透视矩阵
-let line=null, drag=null, dragCorner=-1;
+let line=null;                         // {a:{x,y}, b:{x,y}} 归一化画面坐标
+let act=null;                          // 正在拖的东西
 let units=0, curMs=0;
 let last={ms:0,units:0};               // 上一次「用线」按的
 let step=store.get('step',0.10), lastDir=0;
@@ -149,16 +217,36 @@ $('b').onchange=()=>{store.set('b',+$('b').value);calc();info()};
 $('ar').onchange=()=>{store.set('ar',+$('ar').value);buildH();calc()};
 $('auto').onchange=()=>store.set('auto',$('auto').checked);
 
+// ---------- 版面：画面尽量大，但底部按钮永远看得到 ----------
+function fitStage(){
+  const dock=$('dock').offsetHeight;
+  document.body.style.setProperty('--dockH',(dock+8)+'px');
+  const ar=(v.videoWidth&&v.videoHeight)?v.videoHeight/v.videoWidth:0.75;
+  const top=$('stage').getBoundingClientRect().top+scrollY;
+  const avail=innerHeight-dock-top-$('modes').offsetHeight-14;
+  const maxW=document.documentElement.clientWidth-(v.srcObject?0:24);
+  const h=Math.max(170,avail);
+  const w=Math.min(maxW,h/ar);
+  wrap.style.width=w+'px'; wrap.style.height=Math.round(w*ar)+'px';
+  wrap.style.borderRadius=w>=maxW-1&&v.srcObject?'0':'12px';
+  c.width=Math.round(w*devicePixelRatio); c.height=Math.round(w*ar*devicePixelRatio);
+  draw();
+}
+addEventListener('resize',fitStage);
+addEventListener('orientationchange',()=>setTimeout(fitStage,300));
+v.onloadedmetadata=()=>{fitStage();buildH();calc()};
+
 // ---------- 相机 ----------
-$('cam').onclick=async()=>{
+async function openCam(){
   try{
     const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1280}},audio:false});
-    v.srcObject=s; await v.play(); $('cam').textContent='相机 ✓';
+    v.srcObject=s; await v.play();
+    $('cam').textContent='📷 ✓'; $('cam').className='on'; $('camBig').style.display='none';
     setMode(corners.length===4?'line':'frame');
-  }catch(e){st('相机打不开：'+e.message+'（要用 HTTPS 网址打开）')}
-};
-function resize(){const r=c.getBoundingClientRect();c.width=r.width*devicePixelRatio;c.height=r.height*devicePixelRatio;draw()}
-addEventListener('resize',resize); v.onloadedmetadata=()=>{resize();buildH()};
+    st('相机已开','ok');
+  }catch(e){st('相机打不开：'+e.message+'（要用 HTTPS 网址打开）','err')}
+}
+$('cam').onclick=openCam; $('camBig').onclick=openCam;
 
 // ---------- 模式 ----------
 function setMode(m){
@@ -167,23 +255,26 @@ function setMode(m){
   $('mLine').className=m==='line'?'on':'sec';
   tip(); draw();
 }
-$('mFrame').onclick=()=>{
-  if(mode==='frame'&&corners.length===4){ if(confirmReset())return; }
-  setMode('frame');
+$('mFrame').onclick=()=>setMode('frame');
+$('mLine').onclick=()=>{ if(corners.length<4){st('先点完手机屏幕 4 个角','warn');return} setMode('line'); };
+$('clr').onclick=()=>{
+  corners=[];H=null;store.set('corners',corners);calc();setMode('frame');
+  st('边框已清除，重新点 4 个角','warn');
 };
-$('mLine').onclick=()=>{ if(corners.length<4){st('先点完手机屏幕 4 个角');return} setMode('line'); };
-function confirmReset(){ // 已经在边框模式再按一次 = 清掉重画
-  corners=[];H=null;store.set('corners',corners);tip();draw();st('边框已清除，重新点 4 个角');return true;
-}
 const NAMES=['左上','右上','右下','左下'];
 function tip(){
-  let t;
-  if(!v.srcObject) t='先开相机';
-  else if(mode==='frame') t=corners.length<4
-      ? `点手机屏幕的【${NAMES[corners.length]}】角 (${corners.length+1}/4)`
-      : '边框好了 ✓ 可以拖角微调；再按「①」可清除重画';
-  else t='从起点拉到终点';
-  $('tip').textContent=t;
+  let t,n;
+  if(!v.srcObject){t='先开相机，对准手机屏幕';n='1'}
+  else if(mode==='frame'){
+    n='1';
+    t=corners.length<4
+      ? `点手机屏幕的【${NAMES[corners.length]}】角（${corners.length+1}/4）`
+      : '边框好了 ✓ 可拖动角点微调';
+  }else{
+    n='2';
+    t=line?'拖动红/绿点可微调，或重新画一条':'从起点（你的位置）拉到终点';
+  }
+  $('tip').textContent=t; $('stepNo').textContent=n;
 }
 
 // ---------- 透视 (4 点 homography) ----------
@@ -218,132 +309,203 @@ function toScreen(p){ // 归一化画面坐标 → 手机屏幕坐标 (宽 1000)
 }
 
 // ---------- 触控 ----------
+// 抓住已有的点时保留手指与点的偏移，点不会跳到手指下面；拖动时显示放大镜。
+const clamp=p=>({x:Math.min(1,Math.max(0,p.x)),y:Math.min(1,Math.max(0,p.y))});
 function pt(e){const r=c.getBoundingClientRect();return{x:(e.clientX-r.left)/r.width,y:(e.clientY-r.top)/r.height}}
-function nearCorner(p){
-  const r=c.getBoundingClientRect();
-  let best=-1,bd=30;
-  corners.forEach((q,i)=>{const d=Math.hypot((q.x-p.x)*r.width,(q.y-p.y)*r.height); if(d<bd){bd=d;best=i}});
+function pxDist(a,b){const r=c.getBoundingClientRect();return Math.hypot((a.x-b.x)*r.width,(a.y-b.y)*r.height)}
+function nearest(list,p,maxPx=36){
+  let best=-1,bd=maxPx;
+  list.forEach((q,i)=>{const d=pxDist(q,p); if(d<bd){bd=d;best=i}});
   return best;
 }
 c.onpointerdown=e=>{
-  if(!v.srcObject)return;
+  if(!v.srcObject||act)return;
   c.setPointerCapture(e.pointerId);
   const p=pt(e);
   if(mode==='frame'){
-    dragCorner=nearCorner(p);
-    if(dragCorner<0&&corners.length<4){corners.push(p);dragCorner=corners.length-1;}
+    let i=nearest(corners,p), fresh=false;
+    if(i<0){ if(corners.length>=4)return; corners.push(p); i=corners.length-1; fresh=true; }
+    const q=corners[i];
+    act={kind:'corner',i,off:{x:q.x-p.x,y:q.y-p.y},completes:fresh&&corners.length===4};
     afterCorner();
   }else{
-    drag={a:p,b:p}; line=drag; draw();
+    const ends=line?[line.a,line.b]:[];
+    const i=nearest(ends,p);
+    if(i>=0){
+      const key=i?'b':'a', q=line[key];
+      act={kind:'end',key,off:{x:q.x-p.x,y:q.y-p.y}};
+    }else{
+      act={kind:'end',key:'b',off:{x:0,y:0},prev:line};
+      line={a:p,b:p};
+    }
+    calc();
   }
+  loop();
 };
 c.onpointermove=e=>{
-  const p=pt(e);
-  if(mode==='frame'&&dragCorner>=0){corners[dragCorner]=p;afterCorner();}
-  else if(drag){drag.b=p;calc();draw();}
+  if(!act)return;
+  const p=pt(e), q=clamp({x:p.x+act.off.x,y:p.y+act.off.y});
+  if(act.kind==='corner'){corners[act.i]=q;afterCorner();}
+  else{line[act.key]=q;calc();}
 };
-c.onpointerup=()=>{
-  if(mode==='frame'){
-    dragCorner=-1; store.set('corners',corners);
-    if(corners.length===4&&!line){setTimeout(()=>setMode('line'),400)}
-    return;
+function endDrag(cancel){
+  if(!act)return;
+  const a=act; act=null;
+  if(a.kind==='corner'){
+    store.set('corners',corners);
+    if(a.completes&&!cancel){st('边框完成 ✓','ok');setTimeout(()=>setMode('line'),350)}
+    draw(); return;
   }
-  if(!drag)return;
-  drag=null; calc(); draw();
-  if($('auto').checked&&units>5) pressLine();
-};
-function afterCorner(){buildH();calc();tip();draw();}
+  calc();
+  if(units<5&&'prev'in a){line=a.prev;calc();}       // 只是点一下，不算画线
+  tip(); draw();
+  if(!cancel&&$('auto').checked&&units>5) pressLine();
+}
+c.onpointerup=()=>endDrag(false);
+c.onpointercancel=()=>endDrag(true);
+function afterCorner(){buildH();calc();tip();}
+
+// 拖动期间持续重画（放大镜里是实时画面）
+let raf=0;
+function loop(){ draw(); raf=act?requestAnimationFrame(loop):0; }
 
 // ---------- 计算 ----------
 function calc(){
-  if(!line||!H){units=0;curMs=0;showMs();return}
-  const a=toScreen(line.a), b=toScreen(line.b);
-  units=Math.hypot(b.x-a.x,b.y-a.y);
-  curMs=Math.max(0,Math.round(units*+$('k').value+ +$('b').value));
+  if(!line||!H){units=0;curMs=0;}
+  else{
+    const a=toScreen(line.a), b=toScreen(line.b);
+    units=Math.hypot(b.x-a.x,b.y-a.y);
+    curMs=Math.max(0,Math.round(units*+$('k').value+ +$('b').value));
+  }
   showMs();
 }
 function showMs(){
-  $('ms').innerHTML=units?`${curMs} <small>ms</small><br><small>距离 ${units.toFixed(0)}（屏宽=1000）</small>`
-                         :`— <small>ms</small><br><small>&nbsp;</small>`;
+  $('msN').textContent=units?curMs:'--';
+  $('dist').textContent=units?`距离 ${units.toFixed(0)}（屏宽 = 1000）`:(H?'还没画线':'先画手机边框');
+  $('press').classList.toggle('dim',!units||!rx);
+  const fbOff=!last.units;
+  ['less','ok','more'].forEach(id=>$(id).classList.toggle('dim',fbOff));
 }
 function info(){$('info').textContent=`k = ${(+$('k').value).toFixed(3)}，b = ${+$('b').value} ms，下次调整幅度 ±${(step*100).toFixed(1)}%`}
 
 // ---------- 画 ----------
+function dot(x,y,r,fill,ring='#000'){
+  ctx.beginPath();ctx.arc(x,y,r,0,7);ctx.fillStyle=fill;ctx.fill();
+  ctx.lineWidth=2*devicePixelRatio;ctx.strokeStyle=ring;ctx.stroke();
+}
 function draw(){
-  ctx.clearRect(0,0,c.width,c.height);
   const W=c.width,Hh=c.height,d=devicePixelRatio;
+  ctx.clearRect(0,0,W,Hh);
   if(corners.length){
-    ctx.strokeStyle='#33d6ff'; ctx.lineWidth=3*d; ctx.beginPath();
+    ctx.lineJoin='round';
+    ctx.beginPath();
     corners.forEach((p,i)=>i?ctx.lineTo(p.x*W,p.y*Hh):ctx.moveTo(p.x*W,p.y*Hh));
-    if(corners.length===4)ctx.closePath(); ctx.stroke();
-    ctx.font=`${13*d}px system-ui`;
+    if(corners.length===4)ctx.closePath();
+    ctx.lineWidth=5*d;ctx.strokeStyle='#000a';ctx.stroke();
+    ctx.lineWidth=2.5*d;ctx.strokeStyle='#33d6ff';ctx.stroke();
+    ctx.font=`bold ${13*d}px system-ui`;ctx.textAlign='center';ctx.textBaseline='middle';
     corners.forEach((p,i)=>{
-      ctx.fillStyle='#33d6ff'; ctx.beginPath(); ctx.arc(p.x*W,p.y*Hh,(mode==='frame'?10:5)*d,0,7); ctx.fill();
-      if(mode==='frame'){ctx.fillStyle='#000';ctx.fillText(i+1,p.x*W-4*d,p.y*Hh+4*d)}
+      const big=mode==='frame';
+      dot(p.x*W,p.y*Hh,(big?11:5)*d,'#33d6ff');
+      if(big){ctx.fillStyle='#000';ctx.fillText(i+1,p.x*W,p.y*Hh+.5*d)}
     });
   }
   if(line){
     const a={x:line.a.x*W,y:line.a.y*Hh},b={x:line.b.x*W,y:line.b.y*Hh};
-    ctx.lineWidth=4*d; ctx.strokeStyle='#ffdd33';
-    ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
-    for(const[p,col]of[[a,'#3c9'],[b,'#f55']]){ctx.fillStyle=col;ctx.beginPath();ctx.arc(p.x,p.y,8*d,0,7);ctx.fill()}
+    ctx.lineCap='round';
+    ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);
+    ctx.lineWidth=7*d;ctx.strokeStyle='#000a';ctx.stroke();
+    ctx.lineWidth=4*d;ctx.strokeStyle='#ffd83a';ctx.stroke();
+    const r=(mode==='line'?10:6)*d;
+    dot(a.x,a.y,r,'#2fd07a','#fff'); dot(b.x,b.y,r,'#ff5a4a','#fff');
+    if(units){ // 线中间显示 ms
+      const mx=(a.x+b.x)/2,my=(a.y+b.y)/2,t=curMs+' ms';
+      ctx.font=`bold ${15*d}px system-ui`;ctx.textAlign='center';ctx.textBaseline='middle';
+      const tw=ctx.measureText(t).width+14*d;
+      ctx.fillStyle='#000c';ctx.beginPath();ctx.roundRect?ctx.roundRect(mx-tw/2,my-24*d,tw,22*d,6*d):ctx.rect(mx-tw/2,my-24*d,tw,22*d);ctx.fill();
+      ctx.fillStyle='#ffd83a';ctx.fillText(t,mx,my-13*d);
+    }
   }
+  if(act) loupe();
+}
+// 放大镜：显示手指下方的画面，放在手指的另一侧
+function loupe(){
+  const p=act.kind==='corner'?corners[act.i]:line[act.key];
+  if(!p||!v.videoWidth)return;
+  const W=c.width,Hh=c.height,d=devicePixelRatio;
+  const R=Math.min(62*d,W*0.2), Z=3, m=10*d;
+  const cx=p.x<0.5?W-R-m:R+m, cy=p.y<0.4&&Hh>4*R?Hh-R-m:R+m;
+  const s=v.videoWidth/W, sw=2*R/Z*s;
+  ctx.save();
+  ctx.beginPath();ctx.arc(cx,cy,R,0,7);ctx.clip();
+  ctx.fillStyle='#000';ctx.fillRect(cx-R,cy-R,2*R,2*R);
+  try{ctx.drawImage(v,p.x*v.videoWidth-sw/2,p.y*v.videoHeight-sw/2,sw,sw,cx-R,cy-R,2*R,2*R)}catch{}
+  ctx.strokeStyle='#ff3b3b';ctx.lineWidth=1.5*d;ctx.beginPath();
+  ctx.moveTo(cx-R,cy);ctx.lineTo(cx-5*d,cy);ctx.moveTo(cx+5*d,cy);ctx.lineTo(cx+R,cy);
+  ctx.moveTo(cx,cy-R);ctx.lineTo(cx,cy-5*d);ctx.moveTo(cx,cy+5*d);ctx.lineTo(cx,cy+R);
+  ctx.stroke();
+  ctx.restore();
+  ctx.beginPath();ctx.arc(cx,cy,R,0,7);ctx.lineWidth=3*d;ctx.strokeStyle='#fff';ctx.stroke();
 }
 
 // ---------- 快/慢 校准 ----------
 // 每次按「太久/太短」：把上一次的按压时间 ±step，反推新的 k。
 // 方向跟上次相反 → step 减半（逐步逼近）。
 function feedback(dir){
-  if(!last.units){st('先用「画距离」按一次，再告诉我快了还是慢了');return}
+  if(!last.units){st('先用「按！」按一次，再告诉我太久还是太短','warn');return}
   if(lastDir&&dir!==lastDir) step=Math.max(0.01,step/2);
   lastDir=dir;
   const b=+$('b').value, newMs=last.ms*(1+dir*step);
   const k=Math.max(0.001,(newMs-b)/last.units);
   $('k').value=k.toFixed(4); store.set('k',k); store.set('step',step);
-  st(`${dir<0?'缩短':'加长'} ${(step*100).toFixed(1)}%：刚才那条线下次会按 ${Math.round(newMs)} ms`);
+  st(`${dir<0?'缩短':'加长'} ${(step*100).toFixed(1)}%：刚才那条线下次按 ${Math.round(newMs)} ms`,'ok');
   calc(); info();
 }
 $('less').onclick=()=>feedback(-1);
 $('more').onclick=()=>feedback(+1);
-$('ok').onclick=()=>{step=Math.max(0.01,step/2);lastDir=0;store.set('step',step);st('👍 收窄调整幅度');info()};
-$('resetStep').onclick=()=>{step=0.10;lastDir=0;store.set('step',step);info();st('调整幅度重置为 ±10%')};
+$('ok').onclick=()=>{step=Math.max(0.01,step/2);lastDir=0;store.set('step',step);st('👍 收窄调整幅度','ok');info()};
+$('resetStep').onclick=()=>{step=0.10;lastDir=0;store.set('step',step);info();st('调整幅度重置为 ±10%','ok')};
 
 // ---------- 蓝牙 ----------
+function setConn(on,name){
+  $('conn').className=on?'on':''; $('conn').textContent=on?'🔗 已连接':'连接蓝牙'; showMs();
+}
 $('conn').onclick=async()=>{
-  if(!navigator.bluetooth){st('这个浏览器不支持 Web Bluetooth（用 Android / 电脑 Chrome；iPhone 用 Bluefy）');return}
+  if(!navigator.bluetooth){st('这个浏览器不支持 Web Bluetooth（Android/电脑用 Chrome；iPhone 用 Bluefy）','err');return}
   try{
     st('搜索中…');
     const dev=await navigator.bluetooth.requestDevice({filters:[{services:[SVC]}]});
-    dev.addEventListener('gattserverdisconnected',()=>{rx=null;$('conn').className='';$('conn').textContent='连接蓝牙';st('蓝牙断开')});
+    dev.addEventListener('gattserverdisconnected',()=>{rx=null;setConn(false);st('蓝牙断开','err')});
     const s=await (await dev.gatt.connect()).getPrimaryService(SVC);
     rx=await s.getCharacteristic(RX);
     const tx=await s.getCharacteristic(TX);
     await tx.startNotifications();
     tx.addEventListener('characteristicvaluechanged',e=>{
       const m=new TextDecoder().decode(e.target.value);
-      if(m[0]==='D')st(`已回弹 ✓（${m.slice(1)} ms）结果怎样？用下面按钮告诉我`);
+      if(m[0]==='D')st(`已回弹 ✓（${m.slice(1)} ms）结果怎样？点下面按钮`,'ok');
       if(m[0]==='A'){const[r,p]=m.slice(1).split(',');setAng('ra',+r,false);setAng('pa',+p,false);$('angSt').textContent=`板子上的设定：静止 ${r}°，压下 ${p}°`}
     });
-    $('conn').className='on';$('conn').textContent='已连接';st('已连接 '+dev.name);
+    setConn(true); st('已连接 '+dev.name,'ok');
     send('G');
-  }catch(e){st('连接失败：'+e.message)}
+  }catch(e){st('连接失败：'+e.message,'err')}
 };
 async function send(cmd){
-  if(!rx){st('还没连接蓝牙');return false}
+  if(!rx){st('还没连接蓝牙（点右上角「连接蓝牙」）','warn');return false}
   try{await rx.writeValueWithResponse(new TextEncoder().encode(cmd));return true}
-  catch(e){st('发送失败：'+e.message);return false}
+  catch(e){st('发送失败：'+e.message,'err');return false}
 }
 async function press(ms){
-  ms=Math.round(ms); if(!(ms>0)){st('按压时间要大于 0');return false}
+  ms=Math.round(ms); if(!(ms>0)){st('按压时间要大于 0','warn');return false}
   if(await send('P'+ms)){st('按 '+ms+' ms…');return true}
   return false;
 }
 async function pressLine(){
-  if(!units){st('先画一条线');return}
-  if(await press(curMs)) last={ms:curMs,units};
+  if(!units){st(H?'先在画面上画一条线':'先画手机边框，再画距离','warn');return}
+  if(await press(curMs)){ last={ms:curMs,units}; showMs(); }
 }
 $('press').onclick=pressLine;
 $('go').onclick=()=>press(+$('manual').value);
+
 // ---------- Servo 角度 ----------
 // 拖动时连续发 M<角度>；蓝牙一次只能送一个，忙的时候只留最新值
 let liveBusy=false, livePending=null;
@@ -369,13 +531,13 @@ document.querySelectorAll('.pm').forEach(b=>b.onclick=()=>setAng(b.dataset.t,+$(
 $('toRest').onclick=()=>live(+$('ra').value);
 $('toPush').onclick=()=>live(+$('pa').value);
 $('saveA').onclick=async()=>{
-  if(await send(`A${+$('ra').value},${+$('pa').value}`)) st('角度已保存到板子 ✓');
+  if(await send(`A${+$('ra').value},${+$('pa').value}`)) st('角度已保存到板子 ✓','ok');
 };
 $('tryP').onclick=async()=>{
   // 先存再试，确保用的是现在的角度
   if(await send(`A${+$('ra').value},${+$('pa').value}`)) setTimeout(()=>press(300),150);
 };
 
-info(); tip(); showMs();
+info(); tip(); showMs(); fitStage();
 </script>
 </body></html>
