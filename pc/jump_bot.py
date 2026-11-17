@@ -23,6 +23,7 @@ import math
 import os
 import random
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -118,7 +119,53 @@ def check_device(adb):
     return None
 
 
+SCREENCAP_MODE = 'png'      # 'raw'：手机不压缩、直接传像素（通常比较快）；'png'：手机先压缩
+SCREENCAP_INFO = 'PNG'
+
+
+def screenshot_raw(adb):
+    """screencap 不加 -p：前面 12 或 16 bytes 是 宽、高、格式（1 = RGBA），后面是原始像素。"""
+    d = subprocess.run([adb, 'exec-out', 'screencap'], capture_output=True, timeout=15).stdout
+    if len(d) < 16:
+        return None
+    w, h, fmt = struct.unpack('<III', d[:12])
+    n = w * h * 4
+    if not (0 < w < 10000 and 0 < h < 10000) or fmt not in (1, 5):
+        return None
+    hdr = len(d) - n
+    if hdr not in (12, 16):
+        return None
+    return Image.frombuffer('RGBA', (w, h), d[hdr:hdr + n], 'raw', 'RGBA' if fmt == 1 else 'BGRA', 0, 1).convert('RGB')
+
+
+def pick_screencap_mode(adb):
+    """两种截图方式各试一次，用比较快的那种。"""
+    global SCREENCAP_MODE, SCREENCAP_INFO
+    try:
+        t = time.time(); screenshot_png(adb); t_png = time.time() - t
+    except Exception:  # noqa: BLE001
+        t_png = 99
+    try:
+        t = time.time(); ok = screenshot_raw(adb) is not None; t_raw = time.time() - t if ok else 99
+    except Exception:  # noqa: BLE001
+        t_raw = 99
+    SCREENCAP_MODE = 'raw' if t_raw < t_png else 'png'
+    SCREENCAP_INFO = f'{"原始像素" if SCREENCAP_MODE == "raw" else "PNG"}（PNG {t_png:.2f}s / 原始 {t_raw:.2f}s）'
+    return SCREENCAP_MODE
+
+
 def screenshot(adb):
+    if SCREENCAP_MODE == 'raw':
+        try:
+            im = screenshot_raw(adb)
+            if im is not None:
+                return im
+        except Exception:  # noqa: BLE001
+            pass
+    return screenshot_png(adb)
+
+
+def screenshot_png(adb):
     r = subprocess.run([adb, 'exec-out', 'screencap', '-p'], capture_output=True, timeout=15)
     data = r.stdout
     if not data.startswith(b'\x89PNG'):
