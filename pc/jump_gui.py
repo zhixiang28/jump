@@ -18,7 +18,7 @@ import queue
 import threading
 import time
 import tkinter as tk
-from tkinter import messagebox
+from tkinter import messagebox, ttk
 
 import numpy as np
 from PIL import Image, ImageTk
@@ -29,6 +29,7 @@ import learn
 FONT = ('Microsoft YaHei UI', 11)
 FONT_B = ('Microsoft YaHei UI', 11, 'bold')
 BG, PANEL, TEXT, SUB = '#0e0f12', '#1a1c21', '#f3f4f6', '#c0c5cd'
+CARD = '#1d2026'
 
 
 class App:
@@ -71,86 +72,137 @@ class App:
         r = self.root
         r.title('Servo Press · 手机画面画线')
         r.configure(bg=BG)
-        sh = r.winfo_screenheight()
+        sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
+        self.wide = sw >= 1150                     # 够宽就三栏；太窄就两栏（右边捲动）
         self.max_h = max(400, sh - 140)
+        try:
+            r.state('zoomed')                      # Windows：一打开就最大化
+        except tk.TclError:
+            r.geometry(f'{sw}x{max(500, sh - 60)}+0+0')
+        r.minsize(900, 560)
+        r.grid_rowconfigure(0, weight=1)
 
-        self.cv = tk.Canvas(r, bg='#000', highlightthickness=0, width=int(self.max_h / 2.1), height=self.max_h,
+        style = ttk.Style(r)
+        try:
+            style.theme_use('clam')
+        except tk.TclError:
+            pass
+        style.configure('Treeview', background=CARD, fieldbackground=CARD, foreground=TEXT, rowheight=24,
+                        font=('Microsoft YaHei UI', 10), borderwidth=0)
+        style.configure('Treeview.Heading', background='#30343c', foreground=TEXT, font=('Microsoft YaHei UI', 10, 'bold'),
+                        relief='flat')
+        style.map('Treeview', background=[('selected', '#3b4250')])
+
+        # ---- 第 1 栏：手机画面（跟着视窗高度放大缩小）
+        left = tk.Frame(r, bg=BG)
+        left.grid(row=0, column=0, sticky='ns', padx=(8, 4), pady=8)
+        self.cv = tk.Canvas(left, bg='#000', highlightthickness=0, width=int(self.max_h / 2.2), height=self.max_h,
                             cursor='crosshair')
-        self.cv.pack(side='left', padx=(8, 4), pady=8)
+        self.cv.pack()
         self.cv.bind('<ButtonPress-1>', self.on_down)
         self.cv.bind('<B1-Motion>', self.on_move)
         self.cv.bind('<ButtonRelease-1>', self.on_up)
         self.cv.bind('<Button-3>', lambda e: self.clear_line())
+        self._resize_job = None
+        r.bind('<Configure>', self.on_resize)
 
-        # 右边面板放在可以捲动的区域里：笔电萤幕比较矮也看得到全部（滑鼠滚轮捲动）
-        outer = tk.Frame(r, bg=PANEL)
-        outer.pack(side='left', fill='y', padx=(4, 8), pady=8)
-        pcv = tk.Canvas(outer, bg=PANEL, highlightthickness=0, height=self.max_h, width=360)
-        sb = tk.Scrollbar(outer, orient='vertical', command=pcv.yview)
-        pcv.configure(yscrollcommand=sb.set)
-        sb.pack(side='right', fill='y')
-        pcv.pack(side='left', fill='y')
-        p = tk.Frame(pcv, bg=PANEL, padx=12, pady=10)
-        pcv.create_window((0, 0), window=p, anchor='nw')
-        p.bind('<Configure>', lambda e: pcv.configure(scrollregion=pcv.bbox('all'), width=p.winfo_reqwidth()))
-
-        def wheel(e):
-            d = -1 if (getattr(e, 'num', 0) == 4 or e.delta > 0) else 1
-            pcv.yview_scroll(d * 2, 'units')
-        outer.bind('<Enter>', lambda e: (pcv.bind_all('<MouseWheel>', wheel), pcv.bind_all('<Button-4>', wheel),
-                                         pcv.bind_all('<Button-5>', wheel)))
-        outer.bind('<Leave>', lambda e: (pcv.unbind_all('<MouseWheel>'), pcv.unbind_all('<Button-4>'),
-                                         pcv.unbind_all('<Button-5>')))
+        # ---- 第 2 栏：操作；第 3 栏：学习 + 设定
+        colA = self.scroll_col(r, 1, 380)
+        colB = self.scroll_col(r, 2, 440, expand=True) if self.wide else colA
+        if not self.wide:
+            r.grid_columnconfigure(1, weight=1)
 
         def btn(parent, text, cmd, bg='#262a31', fg=TEXT, **kw):
-            b = tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
-                          relief='flat', font=kw.pop('font', FONT_B), padx=10, pady=6, cursor='hand2', **kw)
-            return b
+            return tk.Button(parent, text=text, command=cmd, bg=bg, fg=fg, activebackground=bg, activeforeground=fg,
+                             relief='flat', font=kw.pop('font', FONT_B), padx=10, pady=6, cursor='hand2', **kw)
 
-        row = tk.Frame(p, bg=PANEL); row.pack(fill='x')
+        def card(parent, title=None):
+            f = tk.Frame(parent, bg=CARD, padx=12, pady=10)
+            f.pack(fill='x', pady=(0, 10))
+            if title:
+                tk.Label(f, text=title, font=('Microsoft YaHei UI', 12, 'bold'), bg=CARD, fg=TEXT).pack(anchor='w', pady=(0, 6))
+            return f
+
+        # 操作卡
+        c = card(colA)
+        row = tk.Frame(c, bg=CARD); row.pack(fill='x')
         self.bt = btn(row, '连接蓝牙', self.connect, bg='#3b7cff', fg='#fff')
         self.bt.pack(side='left', fill='x', expand=True)
         btn(row, '⟳ 截图 (R)', self.refresh).pack(side='left', fill='x', expand=True, padx=(6, 0))
-
-        self.ms_lbl = tk.Label(p, text='--', font=('Microsoft YaHei UI', 40, 'bold'), bg=PANEL, fg=TEXT)
-        self.ms_lbl.pack(anchor='w', pady=(14, 0))
-        self.dist_lbl = tk.Label(p, text='用滑鼠从小人拉到目标', font=FONT, bg=PANEL, fg=SUB, justify='left')
+        self.ms_lbl = tk.Label(c, text='--', font=('Microsoft YaHei UI', 44, 'bold'), bg=CARD, fg=TEXT)
+        self.ms_lbl.pack(anchor='w', pady=(10, 0))
+        self.dist_lbl = tk.Label(c, text='用滑鼠从小人拉到目标', font=FONT, bg=CARD, fg=SUB, justify='left')
         self.dist_lbl.pack(anchor='w')
-
-        self.press_btn = btn(p, '按！(空白键)', self.press_line, bg='#3b7cff', fg='#fff',
+        self.press_btn = btn(c, '按！(空白键)', self.press_line, bg='#3b7cff', fg='#fff',
                              font=('Microsoft YaHei UI', 18, 'bold'))
         self.press_btn.pack(fill='x', pady=(12, 8))
-
-        fb = tk.Frame(p, bg=PANEL); fb.pack(fill='x')
+        fb = tk.Frame(c, bg=CARD); fb.pack(fill='x')
         btn(fb, '− 太久 (1)', lambda: self.feedback(-1), bg='#d9472f', fg='#fff').pack(side='left', fill='x', expand=True)
         btn(fb, '✓ 刚好 (2)', self.ok, bg='#1fa955', fg='#fff').pack(side='left', fill='x', expand=True, padx=6)
         btn(fb, '＋ 太短 (3)', lambda: self.feedback(1), bg='#d58f12', fg='#fff').pack(side='left', fill='x', expand=True)
-
         self.v_play = tk.BooleanVar(value=False)
-        self.play_btn = btn(p, '🤖 AI 自动玩 (A)', self.toggle_play_btn, bg='#7b3fe4', fg='#fff',
-                            font=('Microsoft YaHei UI', 14, 'bold'))
-        self.play_btn.pack(fill='x', pady=(8, 0))
+        self.play_btn = btn(c, '🤖 AI 自动玩 (A)', self.toggle_play_btn, bg='#7b3fe4', fg='#fff',
+                            font=('Microsoft YaHei UI', 15, 'bold'))
+        self.play_btn.pack(fill='x', pady=(10, 0))
         self.v_play.trace_add('write', lambda *a: self.sync_play_btn())
 
-        self.st = tk.Label(p, text='', font=FONT, bg=PANEL, fg=SUB, wraplength=330, justify='left', height=3, anchor='nw')
-        self.st.pack(fill='x', pady=(10, 4))
+        # 状态卡
+        c = card(colA, '状态')
+        self.st = tk.Label(c, text='', font=FONT, bg=CARD, fg=SUB, wraplength=340, justify='left', height=4,
+                           anchor='nw')
+        self.st.pack(fill='x')
 
-        def check(text, key, cmd=None):
+        # 选项卡
+        c = card(colA, '选项')
+
+        def check(parent, text, key, cmd=None):
             var = tk.BooleanVar(value=bool(self.cfg.get(key)))
 
             def on():
                 self.cfg[key] = var.get(); jb.save_config(self.cfg)
                 if cmd: cmd()
-            tk.Checkbutton(p, text=text, variable=var, command=on, font=FONT, bg=PANEL, fg=TEXT, selectcolor='#262a31',
-                           activebackground=PANEL, activeforeground=TEXT, anchor='w').pack(fill='x')
+            tk.Checkbutton(parent, text=text, variable=var, command=on, font=FONT, bg=CARD, fg=TEXT,
+                           selectcolor='#262a31', activebackground=CARD, activeforeground=TEXT,
+                           anchor='w').pack(fill='x')
             return var
-        self.v_auto = check('画完自动按', 'gui_auto')
-        self.v_proj = check('只算沿跳跃方向的距离', 'gui_proj', self.recalc)
-        self.v_live = check('自动刷新画面（每 1.5 秒）', 'gui_live')
+        self.v_auto = check(c, '画完自动按', 'gui_auto')
+        self.v_proj = check(c, '只算沿跳跃方向的距离', 'gui_proj', self.recalc)
+        self.v_live = check(c, '自动刷新画面（每 1.5 秒）', 'gui_live')
+        self.v_calib = check(c, '跳完自动量落点、校准 k/b', 'auto_calib')
 
-        def entry(label, key, width=7):
-            f = tk.Frame(p, bg=PANEL); f.pack(fill='x', pady=2)
-            tk.Label(f, text=label, font=FONT, bg=PANEL, fg=TEXT, width=12, anchor='w').pack(side='left')
+        # 学习卡
+        c = card(colB, '🧠 学习')
+        self.learn_lbl = tk.Label(c, text='', font=('Microsoft YaHei UI', 10), bg=CARD, fg=SUB, justify='left',
+                                  wraplength=400)
+        self.learn_lbl.pack(anchor='w')
+        lr = tk.Frame(c, bg=CARD); lr.pack(fill='x', pady=(8, 0))
+        self.fit_btn = btn(lr, '套用拟合 k/b', self.apply_fit, font=FONT)
+        self.fit_btn.pack(side='left')
+        btn(lr, '清除学习', self.clear_learn, font=FONT).pack(side='left', padx=6)
+
+        # 落点误差图
+        c = card(colB, '🎯 落点误差（最近 30 跳，绿 = ±3% 内）')
+        self.chart = tk.Canvas(c, bg='#15171b', highlightthickness=0, height=130, width=400)
+        self.chart.pack(fill='x')
+        self.chart.bind('<Configure>', lambda e: self.draw_chart())
+
+        # 最近跳跃纪录
+        c = card(colB, '📋 最近跳跃')
+        cols = ('n', 'who', 'dist', 'ms', 'land')
+        self.hist = ttk.Treeview(c, columns=cols, show='headings', height=8)
+        for col, title, w in zip(cols, ('#', '谁', '距离', 'ms', '落点'), (44, 50, 80, 70, 110)):
+            self.hist.heading(col, text=title)
+            self.hist.column(col, width=w, anchor='center', stretch=True)
+        self.hist.tag_configure('good', foreground='#5fe08f')
+        self.hist.tag_configure('bad', foreground='#ff7b66')
+        self.hist.pack(fill='x')
+
+        # 设定卡
+        c = card(colB, '⚙ 设定')
+
+        def entry(label, key, width=8):
+            f = tk.Frame(c, bg=CARD); f.pack(fill='x', pady=2)
+            tk.Label(f, text=label, font=FONT, bg=CARD, fg=TEXT, width=12, anchor='w').pack(side='left')
             e = tk.Entry(f, width=width, font=FONT, bg='#0b0c0f', fg=TEXT, insertbackground=TEXT, relief='flat')
             e.insert(0, str(self.cfg[key])); e.pack(side='left')
 
@@ -163,37 +215,101 @@ class App:
                 self.cv.focus_set()
             e.bind('<Return>', save); e.bind('<FocusOut>', save)
             return e
-        lf = tk.Frame(p, bg='#24272e', padx=8, pady=6); lf.pack(fill='x', pady=(8, 0))
-        tk.Label(lf, text='🧠 学习', font=FONT_B, bg='#24272e', fg=TEXT).pack(anchor='w')
-        self.learn_lbl = tk.Label(lf, text='', font=('Microsoft YaHei UI', 10), bg='#24272e', fg=SUB,
-                                  justify='left', wraplength=320)
-        self.learn_lbl.pack(anchor='w')
-        lr = tk.Frame(lf, bg='#24272e'); lr.pack(fill='x', pady=(4, 0))
-        self.fit_btn = btn(lr, '套用拟合 k/b', self.apply_fit, font=FONT)
-        self.fit_btn.pack(side='left')
-        btn(lr, '清除学习', self.clear_learn, font=FONT).pack(side='left', padx=6)
-        self.v_calib = tk.BooleanVar(value=bool(self.cfg['auto_calib']))
-
-        def on_calib():
-            self.cfg['auto_calib'] = self.v_calib.get(); jb.save_config(self.cfg)
-        tk.Checkbutton(lf, text='跳完自动量落点、校准 k/b', variable=self.v_calib, command=on_calib, font=FONT,
-                       bg='#24272e', fg=TEXT, selectcolor='#262a31', activebackground='#24272e',
-                       activeforeground=TEXT, anchor='w').pack(fill='x', pady=(4, 0))
-
-        tk.Label(p, text='', bg=PANEL).pack()
         self.e_k = entry('k', 'k')
         self.e_b = entry('b (ms)', 'b')
         self.e_ang = entry('跳跃角度 (°)', 'jump_angle_deg')
         self.e_wait = entry('按完等几秒', 'wait_after')
-        tk.Label(p, text='按压时间 = 距离 × k + b\n距离单位：手机屏幕宽 = 1000\n'
-                         '\n空白键 按 · R 截图 · 右键 清除线\n1 太久 · 2 刚好 · 3 太短\nA AI 自动玩 · Esc 停止',
-                 font=('Microsoft YaHei UI', 10), bg=PANEL, fg=SUB, justify='left').pack(anchor='w', pady=(10, 0))
-        self.info_lbl = tk.Label(p, text='', font=('Microsoft YaHei UI', 10), bg=PANEL, fg=SUB, justify='left')
+        self.info_lbl = tk.Label(c, text='', font=('Microsoft YaHei UI', 10), bg=CARD, fg=SUB, justify='left')
         self.info_lbl.pack(anchor='w', pady=(6, 0))
+        tk.Label(c, text='按压时间 = 距离 × k + b（距离：手机屏幕宽 = 1000）\n\n'
+                         '快捷键：空白键 按 · R 截图 · 右键 清除线\n'
+                         '1 太久 · 2 刚好 · 3 太短 · A AI 自动玩 · Esc 停止',
+                 font=('Microsoft YaHei UI', 10), bg=CARD, fg=SUB, justify='left').pack(anchor='w', pady=(8, 0))
+
         self.show_info()
         self.update_learn()
-
         r.bind('<KeyPress>', self.on_key)
+
+    def scroll_col(self, r, column, width, expand=False):
+        """一栏可以捲动的区域（滑鼠移到上面时，滚轮捲这一栏）。回传里面放东西的 Frame。"""
+        outer = tk.Frame(r, bg=BG)
+        outer.grid(row=0, column=column, sticky='nsew', padx=4, pady=8)
+        if expand:
+            r.grid_columnconfigure(column, weight=1)
+        cv = tk.Canvas(outer, bg=BG, highlightthickness=0, width=width)
+        sb = tk.Scrollbar(outer, orient='vertical', command=cv.yview)
+        cv.configure(yscrollcommand=sb.set)
+        sb.pack(side='right', fill='y')
+        cv.pack(side='left', fill='both', expand=True)
+        inner = tk.Frame(cv, bg=BG)
+        win = cv.create_window((0, 0), window=inner, anchor='nw')
+        inner.bind('<Configure>', lambda e: cv.configure(scrollregion=cv.bbox('all')))
+        cv.bind('<Configure>', lambda e: cv.itemconfigure(win, width=e.width))
+
+        def wheel(e):
+            d = -1 if (getattr(e, 'num', 0) == 4 or getattr(e, 'delta', 0) > 0) else 1
+            if cv.bbox('all') and cv.bbox('all')[3] > cv.winfo_height():
+                cv.yview_scroll(d * 2, 'units')
+        outer.bind('<Enter>', lambda e: (cv.bind_all('<MouseWheel>', wheel), cv.bind_all('<Button-4>', wheel),
+                                         cv.bind_all('<Button-5>', wheel)))
+        outer.bind('<Leave>', lambda e: (cv.unbind_all('<MouseWheel>'), cv.unbind_all('<Button-4>'),
+                                         cv.unbind_all('<Button-5>')))
+        return inner
+
+    def on_resize(self, e):
+        if e.widget is not self.root:
+            return
+        if self._resize_job:
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(150, self.after_resize)
+
+    def after_resize(self):
+        self._resize_job = None
+        h = max(300, self.root.winfo_height() - 16)
+        if abs(h - self.max_h) > 4:
+            self.max_h = h
+            if self.img:
+                self.render(); self.draw()
+            else:
+                self.cv.config(height=h, width=int(h / 2.2))
+
+    def draw_chart(self):
+        c = self.chart
+        c.delete('all')
+        W, H = max(50, c.winfo_width()), int(c.cget('height'))
+        mid = H / 2
+        lim = 12.0                                              # ±12% 画满
+        band = 3 / lim * (H / 2 - 8)
+        c.create_rectangle(0, mid - band, W, mid + band, fill='#1d3326', outline='')
+        c.create_line(0, mid, W, mid, fill='#4a4f58')
+        c.create_text(4, 8, text='跳过头 +', anchor='w', fill=SUB, font=('Microsoft YaHei UI', 8))
+        c.create_text(4, H - 8, text='不够远 −', anchor='w', fill=SUB, font=('Microsoft YaHei UI', 8))
+        rs = [r for r in self.store.recs if r.get('land')][-30:]
+        if not rs:
+            c.create_text(W / 2, mid, text='还没有落点资料（跳完会自动量）', fill=SUB, font=FONT)
+            return
+        bw = (W - 70) / 30
+        for i, r in enumerate(rs):
+            units = max(1.0, r['land']['traveled'] - r['land']['err'])
+            pct = r['land']['err'] / units * 100
+            h = max(-1.0, min(1.0, pct / lim)) * (H / 2 - 8)
+            col = '#2fd07a' if abs(pct) < 3 else '#e5a12a' if abs(pct) < 6 else '#ff6b55'
+            x = 64 + i * bw
+            c.create_rectangle(x, mid, x + bw * 0.7, mid - h, fill=col, outline='#e9a0ff' if r.get('auto') else '')
+
+    def update_history(self):
+        t = self.hist
+        t.delete(*t.get_children())
+        n = len(self.store.recs)
+        for i, r in enumerate(reversed(self.store.recs[-40:])):
+            land, tag = '—', ''
+            if r.get('land'):
+                units = max(1.0, r['land']['traveled'] - r['land']['err'])
+                pct = r['land']['err'] / units * 100
+                land = f'{pct:+.1f}%' + (' 🎯' if abs(pct) < 2 else '')
+                tag = 'good' if abs(pct) < 3 else 'bad'
+            t.insert('', 'end', values=(n - i, 'AI' if r.get('auto') else '你', f'{r["units"]:.0f}', r['ms'], land),
+                     tags=(tag,))
 
     def status(self, t, kind=''):
         self.st.config(text=t, fg={'ok': '#5fe08f', 'warn': '#ffc14d', 'err': '#ff7b66'}.get(kind, SUB))
@@ -284,6 +400,13 @@ class App:
         if err:
             self.status(f'截图失败：{err}', 'err'); return
         self.img = im
+        self.render()
+        self.pred = None
+        self.draw()
+        self.predict_async()
+
+    def render(self):
+        im = self.img
         w, h = im.size
         self.scale = min(self.max_h / h, 1.0)
         disp = im.resize((max(1, int(w * self.scale)), max(1, int(h * self.scale))), Image.LANCZOS)
@@ -292,9 +415,6 @@ class App:
         self.cv.delete('img')
         self.cv.create_image(0, 0, anchor='nw', image=self.photo, tags='img')
         self.cv.tag_lower('img')
-        self.pred = None
-        self.draw()
-        self.predict_async()
 
     def live_tick(self):
         if self.v_live.get() and not self.drag and not self.busy:
@@ -592,6 +712,8 @@ class App:
             lines.append(f'有结果的 {f["n"]} 笔（按 1/2/3），满 8 笔就能拟合 k/b')
         self.learn_lbl.config(text='\n'.join(lines))
         self.fit_btn.config(state='normal' if self.fit else 'disabled')
+        self.draw_chart()
+        self.update_history()
 
     def apply_fit(self):
         if not self.fit:
