@@ -14,6 +14,9 @@
 """
 import asyncio
 import math
+import os
+import subprocess
+import sys
 import queue
 import threading
 import time
@@ -179,6 +182,8 @@ class App:
         self.fit_btn = btn(lr, '套用拟合 k/b', self.apply_fit, font=FONT)
         self.fit_btn.pack(side='left')
         btn(lr, '清除学习', self.clear_learn, font=FONT).pack(side='left', padx=6)
+        self.export_btn = btn(lr, '📦 导出数据', self.export_data, bg='#2f6f9f', fg='#fff', font=FONT)
+        self.export_btn.pack(side='left')
 
         # 落点误差图
         c = card(colB, '🎯 落点误差（最近 30 跳，绿 = ±3% 内）')
@@ -551,10 +556,16 @@ class App:
         if self.press(self.ms):
             self.last = {'ms': self.ms, 'units': self.units}
             p = self.pred if self.pred and 'units' in self.pred else None
-            self.cur_rec = self.store.add(self.img, self.line['a'], self.line['b'], self.units, self.ms, pred=p)
+            self.cur_rec = self.store.add(self.img, self.line['a'], self.line['b'], self.units, self.ms, pred=p,
+                                          extra=self.press_extra())
             self.pending = (self.make_jump(self.line['a'], self.line['b'], self.units), self.cur_rec)
             self.tpls = learn.build_templates(self.store)     # 学新的小人样子
             self.update_learn()
+
+    def press_extra(self):
+        """每一跳额外记下来的东西（导出后用来重新校准）。"""
+        return {'k_used': self.cfg['k'], 'b_used': self.cfg['b'], 't_press': round(time.time(), 3),
+                'proj': bool(self.cfg.get('gui_proj')), 'angle': self.cfg.get('jump_angle_deg')}
 
     def make_jump(self, a, b, units):
         """这一跳原本要跳的方向和距离。AI 有量到目标、而且跟你画的终点差不多时，用 AI 量的（比较精确）。"""
@@ -585,6 +596,8 @@ class App:
             self.status(f'按压失败：{err}（蓝牙可能断了，重新连接）', 'err')
             self.esp = None; self.bt.config(text='连接蓝牙', bg='#3b7cff')
             return
+        if self.cur_rec is not None and self.cur_rec.get('ms') == ms:
+            self.cur_rec['t_done'] = round(time.time(), 3)      # ESP 回报按完的时间
         self.status(f'已按 {ms} ms ✓ 等画面停下来量落点…（也可以按 1 太久 / 2 刚好 / 3 太短）', 'ok')
 
         def done():
@@ -604,6 +617,7 @@ class App:
         jb.save_config(self.cfg)
         self.e_k.delete(0, 'end'); self.e_k.insert(0, str(self.cfg['k']))
         self.store.set_result(self.cur_rec, d, new_ms); self.update_learn()
+        self.store.event('feedback', id=self.cur_rec and self.cur_rec['id'], result=d, k=self.cfg['k'])
         self.status(f'{"加长" if d > 0 else "缩短"} {self.cfg["step"] * 100:.1f}%：刚才那条线下次按 {round(new_ms)} ms'
                     f'（k = {self.cfg["k"]}）', 'ok')
         self.show_info(); self.recalc()
@@ -611,6 +625,7 @@ class App:
     def ok(self):
         if self.last:
             self.store.set_result(self.cur_rec, 0, self.last['ms']); self.update_learn()
+            self.store.event('feedback', id=self.cur_rec and self.cur_rec['id'], result=0)
         self.cfg['step'] = max(0.005, self.cfg['step'] / 2); self.last_dir = 0
         jb.save_config(self.cfg); self.show_info()
         self.status(f'👍 调整幅度收窄为 ±{self.cfg["step"] * 100:.1f}%', 'ok')
@@ -632,7 +647,7 @@ class App:
     def after_pred(self, img, res, err, pend=None):
         p, land = res if res else ({'err': str(err)}, None)
         if pend:
-            self.handle_landing(land, pend)
+            self.handle_landing(land, pend, img)
         if img is not self.img:
             return                                   # 画面已经换了
         if 'units' in p:                             # k/b 可能刚被校准过：用最新的重算 ms
@@ -643,8 +658,10 @@ class App:
         if self.v_play.get():
             self.root.after(150, self.auto_step)
 
-    def handle_landing(self, land, pend):
+    def handle_landing(self, land, pend, img=None):
         jump, rec = pend
+        self.store.save_after(rec, img)                 # 跳完的画面也存起来（导出用）
+        self.store.event('landing', id=rec['id'], result=land)
         if land is None:
             self.status('量不到这一跳的落点（这块没有奶油色顶面），可以按 1/2/3 告诉我结果', 'warn'); return
         if land.get('lost'):
@@ -653,7 +670,8 @@ class App:
                 self.v_play.set(False)
             return
         e, units = land['err'], jump['units']
-        rec['land'] = {'err': round(e, 1), 'traveled': round(land['traveled'], 1)}
+        rec['land'] = {'err': round(e, 1), 'traveled': round(land['traveled'], 1),
+                       'foot': land.get('foot'), 'face': land.get('face'), 'score': land.get('score')}
         if rec.get('r') is None:                     # 自动填结果（你按 1/2/3 会覆盖）
             pct = e / max(1.0, units)
             rec['r'] = 0 if abs(pct) < 0.03 else (-1 if pct > 0 else 1)
@@ -681,6 +699,7 @@ class App:
             how = '（单跳修正）'
         if k == self.cfg['k'] and b == self.cfg['b']:
             return ''
+        self.store.event('calibrate', k_old=self.cfg['k'], b_old=self.cfg['b'], k=k, b=b, how=how)
         self.cfg['k'], self.cfg['b'] = k, b
         jb.save_config(self.cfg)
         for e, key in ((self.e_k, 'k'), (self.e_b, 'b')):
@@ -732,6 +751,29 @@ class App:
         self.recalc(); self.predict_async()
         self.status(f'已套用拟合：k = {self.cfg["k"]}，b = {self.cfg["b"]} ms', 'ok')
 
+    def export_data(self):
+        if not self.store.recs:
+            self.status('还没有资料可以导出（先玩几跳）', 'warn'); return
+        self.export_btn.config(state='disabled', text='导出中…')
+        info = {'截图方式': jb.SCREENCAP_INFO}
+        if self.img:
+            info['手机截图大小'] = f'{self.img.size[0]}x{self.img.size[1]}'
+        self.bg(lambda: learn.export(self.store, dict(self.cfg), info), self.after_export)
+
+    def after_export(self, path, err):
+        self.export_btn.config(state='normal', text='📦 导出数据')
+        if err:
+            self.status(f'导出失败：{err}', 'err'); return
+        size = os.path.getsize(path) / 1e6
+        self.status(f'已导出（{size:.1f} MB）：{path}\n把这个 zip 和录屏一起传给我', 'ok')
+        try:                                           # 打开资料夹、选中这个档案
+            if sys.platform.startswith('win'):
+                subprocess.Popen(['explorer', '/select,', os.path.normpath(path)])
+            elif sys.platform == 'darwin':
+                subprocess.Popen(['open', '-R', path])
+        except Exception:  # noqa: BLE001
+            pass
+
     def clear_learn(self):
         if not messagebox.askyesno('清除学习', '清除所有学习纪录和截图？（k、b 不会变）'):
             return
@@ -744,6 +786,7 @@ class App:
 
     def sync_play_btn(self):
         on = self.v_play.get()
+        self.store.event('ai_auto', on=on)
         self.play_btn.config(text='⏸ 停止 AI（A / Esc）' if on else '🤖 AI 自动玩 (A)',
                              bg='#d9472f' if on else '#7b3fe4', activebackground='#d9472f' if on else '#7b3fe4')
 
@@ -786,7 +829,8 @@ class App:
         b = (p['center'][0] * W, p['center'][1] * W)
         if self.press(p['ms']):
             self.last = {'ms': p['ms'], 'units': p['units']}
-            self.cur_rec = self.store.add(self.img, a, b, p['units'], p['ms'], pred=p, auto=True)
+            self.cur_rec = self.store.add(self.img, a, b, p['units'], p['ms'], pred=p, auto=True,
+                                          extra=self.press_extra())
             self.pending = (self.make_jump(a, b, p['units']), self.cur_rec)
             self.update_learn()
 

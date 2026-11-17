@@ -11,10 +11,13 @@
 所有座标都用「手机屏幕宽 = 1」的比例（x/W, y/W），所以跟截图解析度无关。
 纪录存在 pc/data/（log.json + 缩小的截图）。
 """
+import csv
 import json
 import math
 import os
+import platform
 import time
+import zipfile
 from collections import deque
 
 import numpy as np
@@ -24,6 +27,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, 'data')
 SHOTS = os.path.join(DATA, 'shots')
 LOG = os.path.join(DATA, 'log.json')
+EVENTS = os.path.join(DATA, 'events.csv')
+EXPORT = os.path.join(HERE, 'export')
 
 NW = 540            # 学习 / 比对用的截图宽度
 MAX_RECS = 300
@@ -51,8 +56,8 @@ class Store:
             json.dump(self.recs, f, ensure_ascii=False)
         os.replace(tmp, LOG)
 
-    def add(self, im, a, b, units, ms, pred=None, auto=False):
-        """a, b：截图像素座标。回传这笔纪录。"""
+    def add(self, im, a, b, units, ms, pred=None, auto=False, extra=None):
+        """a, b：截图像素座标。extra：其他要记下来的栏位（当时的 k、b、按下的时间…）。回传这笔纪录。"""
         W, H = im.size
         rid = time.strftime('%Y%m%d-%H%M%S') + f'-{int(time.time() * 1000) % 1000:03d}'
         try:
@@ -63,16 +68,47 @@ class Store:
                'a': [a[0] / W, a[1] / W], 'b': [b[0] / W, b[1] / W],
                'units': round(units, 1), 'ms': int(ms), 'auto': bool(auto),
                'r': None, 'est': None,
-               'pred': ({'units': round(pred['units'], 1), 'score': round(pred['score'], 3)} if pred else None)}
+               'pred': ({'units': round(pred['units'], 1), 'score': round(pred['score'], 3),
+                         'foot': [round(v, 4) for v in pred['foot']], 'center': [round(v, 4) for v in pred['center']]}
+                        if pred and 'foot' in pred else None)}
+        if extra:
+            rec.update({k: v for k, v in extra.items() if k not in rec})   # 不覆盖原本的栏位
         self.recs.append(rec)
         while len(self.recs) > MAX_RECS:
             old = self.recs.pop(0)
-            try:
-                os.remove(os.path.join(SHOTS, old['id'] + '.jpg'))
-            except OSError:
-                pass
+            for suffix in ('.jpg', '_after.jpg'):
+                try:
+                    os.remove(os.path.join(SHOTS, old['id'] + suffix))
+                except OSError:
+                    pass
         self.save()
+        self.event('press', id=rid, ms=int(ms), units=round(units, 1), auto=bool(auto))
         return rec
+
+    def save_after(self, rec, im):
+        """跳完、画面停下来之后的截图（量落点用的那张），导出给你检查用。"""
+        if rec is None or im is None:
+            return
+        try:
+            W, H = im.size
+            im.resize((NW, round(H * NW / W)), Image.BILINEAR).save(os.path.join(SHOTS, rec['id'] + '_after.jpg'),
+                                                                    quality=90)
+        except Exception as e:  # noqa: BLE001
+            print('跳完的截图存不了：', e)
+
+    def event(self, kind, **kv):
+        """操作纪录（data/events.csv）：时间精确到毫秒，方便跟录影对时间。"""
+        try:
+            new = not os.path.exists(EVENTS)
+            with open(EVENTS, 'a', encoding='utf-8', newline='') as f:
+                w = csv.writer(f)
+                if new:
+                    w.writerow(['time', 'clock', 'event', 'detail'])
+                t = time.time()
+                w.writerow([f'{t:.3f}', time.strftime('%H:%M:%S', time.localtime(t)) + f'.{int(t * 1000) % 1000:03d}',
+                            kind, json.dumps(kv, ensure_ascii=False)])
+        except Exception:  # noqa: BLE001
+            pass
 
     def set_result(self, rec, r, est):
         if rec is None:
@@ -83,12 +119,14 @@ class Store:
 
     def clear(self):
         for r in self.recs:
-            try:
-                os.remove(os.path.join(SHOTS, r['id'] + '.jpg'))
-            except OSError:
-                pass
+            for suffix in ('.jpg', '_after.jpg'):
+                try:
+                    os.remove(os.path.join(SHOTS, r['id'] + suffix))
+                except OSError:
+                    pass
         self.recs = []
         self.save()
+        self.event('clear')
 
     def shot(self, rec):
         return Image.open(os.path.join(SHOTS, rec['id'] + '.jpg')).convert('RGB')
@@ -381,7 +419,9 @@ def landing(im, tpls, jump, ch=None):
     err = dx * ux + dy * uy
     if abs(err) > face['width'] * 1000 * 0.7:           # 偏太多：可能不是站在这块上，不采用
         return None
-    return {'err': err, 'traveled': jump['units'] + err}
+    return {'err': err, 'traveled': jump['units'] + err,
+            'foot': [round(v, 4) for v in ch['foot']], 'face': [round(v, 4) for v in face['center']],
+            'score': round(ch['score'], 3)}
 
 
 def find_target(im, foot, angle_deg=30, diff_thr=45):
@@ -622,3 +662,55 @@ def fit_kb(store, proj=True):
     if k <= 0:
         return {'n': n, 'cnt': cnt, 'bad': True}
     return {'n': n, 'cnt': cnt, 'k': float(k), 'b': float(b), 'rms': rms}
+
+
+# ================================================================ 导出
+def export(store, cfg, extra_info=None):
+    """把学习纪录、设定、操作纪录、截图打包成一个 zip（pc/export/）。回传 zip 路径。"""
+    os.makedirs(EXPORT, exist_ok=True)
+    name = 'servo_export_' + time.strftime('%Y%m%d-%H%M%S') + '.zip'
+    path = os.path.join(EXPORT, name)
+    recs = store.recs
+
+    # 每一跳一行，Excel 可以直接打开（utf-8-sig 让 Excel 认得中文）
+    rows = [['#', 'id', '时间', '谁', '距离', '按压ms', '当时k', '当时b', 'AI预测距离', 'AI小人信心',
+             '落点偏差', '落点偏差%', '实际跳的距离', '结果(-1太久 0刚好 1太短)', '按下时间', 'ESP回报按完时间']]
+    for i, r in enumerate(recs, 1):
+        land = r.get('land') or {}
+        units = (land.get('traveled', 0) - land.get('err', 0)) if land else 0
+        pct = f'{land["err"] / units * 100:+.2f}' if land and units > 0 else ''
+        pred = r.get('pred') or {}
+        rows.append([i, r['id'], r['id'][:15], 'AI' if r.get('auto') else '你', r['units'], r['ms'],
+                     r.get('k_used', ''), r.get('b_used', ''), pred.get('units', ''), pred.get('score', ''),
+                     land.get('err', ''), pct, land.get('traveled', ''), '' if r.get('r') is None else r['r'],
+                     r.get('t_press', ''), r.get('t_done', '')])
+    lc = land_count(store)
+    sh = shadow_stats(store)
+    ls = land_stats(store)
+    fl = fit_land(store)
+    summary = [
+        f'导出时间：{time.strftime("%Y-%m-%d %H:%M:%S")}',
+        f'纪录：{len(recs)} 跳（你画的 {sum(1 for r in recs if not r.get("auto"))}，AI {sum(1 for r in recs if r.get("auto"))}）',
+        f'量到落点：{lc} 跳' + (f'，最近 {ls["n"]} 跳平均偏 {ls["mean"] * 100:.2f}%' if ls else ''),
+        f'AI vs 你：' + (f'最近 {sh["n"]} 跳中位误差 {sh["med"] * 100:.2f}%' if sh.get('n') else '没有资料'),
+        f'目前 k = {cfg.get("k")}, b = {cfg.get("b")}, 跳跃角度 {cfg.get("jump_angle_deg")}°, 投影 {cfg.get("gui_proj")}',
+        '落点拟合：' + (f'k = {fl["k"]:.4f}, b = {fl["b"]:.1f}（{fl["n"]} 跳，±{fl["rms"]:.1f} ms）' if fl else '资料不够'),
+        f'学到的跳跃角度：{learned_angle(store)}',
+        f'电脑：{platform.platform()}，Python {platform.python_version()}',
+    ] + [f'{k}：{v}' for k, v in (extra_info or {}).items()]
+
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
+        z.writestr('summary.txt', '\n'.join(summary))
+        z.writestr('jump_config.json', json.dumps(cfg, ensure_ascii=False, indent=2))
+        z.writestr('log.json', json.dumps(recs, ensure_ascii=False, indent=1))
+        buf = __import__('io').StringIO()
+        csv.writer(buf).writerows(rows)
+        z.writestr('jumps.csv', '\ufeff' + buf.getvalue())
+        if os.path.exists(EVENTS):
+            z.write(EVENTS, 'events.csv')
+        for r in recs:
+            for suffix in ('.jpg', '_after.jpg'):
+                f = os.path.join(SHOTS, r['id'] + suffix)
+                if os.path.exists(f):
+                    z.write(f, 'shots/' + r['id'] + suffix, compress_type=zipfile.ZIP_STORED)
+    return path
