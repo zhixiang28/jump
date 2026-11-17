@@ -123,9 +123,12 @@ SCREENCAP_MODE = 'png'      # 'raw'：手机不压缩、直接传像素（通常
 SCREENCAP_INFO = 'PNG'
 
 
-def screenshot_raw(adb):
+SHOT_TIMEOUT = 8            # 一次截图最多等几秒（手机偶尔会卡住，等再久也不会回来）
+
+
+def screenshot_raw(adb, timeout=None):
     """screencap 不加 -p：前面 12 或 16 bytes 是 宽、高、格式（1 = RGBA），后面是原始像素。"""
-    d = subprocess.run([adb, 'exec-out', 'screencap'], capture_output=True, timeout=15).stdout
+    d = subprocess.run([adb, 'exec-out', 'screencap'], capture_output=True, timeout=timeout or SHOT_TIMEOUT).stdout
     if len(d) < 16:
         return None
     w, h, fmt = struct.unpack('<III', d[:12])
@@ -154,19 +157,59 @@ def pick_screencap_mode(adb):
     return SCREENCAP_MODE
 
 
-def screenshot(adb):
-    if SCREENCAP_MODE == 'raw':
+def adb_reconnect(adb):
+    """adb 卡住时让它重新连线（不用拔线）。"""
+    for args in (['reconnect'], ['wait-for-device']):
         try:
-            im = screenshot_raw(adb)
-            if im is not None:
-                return im
+            subprocess.run([adb] + args, capture_output=True, timeout=10)
         except Exception:  # noqa: BLE001
             pass
-    return screenshot_png(adb)
 
 
-def screenshot_png(adb):
-    r = subprocess.run([adb, 'exec-out', 'screencap', '-p'], capture_output=True, timeout=15)
+def screenshot(adb, tries=3):
+    """截图。手机偶尔会卡住：每次最多等 SHOT_TIMEOUT 秒，失败就换另一种方式再试；
+    第二次失败时让 adb 重新连线。全部失败才丢出错误。"""
+    order = [SCREENCAP_MODE, 'png' if SCREENCAP_MODE == 'raw' else 'raw']
+    last = None
+    for i in range(tries):
+        mode = order[i % 2]
+        try:
+            im = screenshot_raw(adb) if mode == 'raw' else screenshot_png(adb)
+            if im is not None:
+                return im
+            last = RuntimeError('截到的资料不完整')
+        except subprocess.TimeoutExpired:
+            last = RuntimeError(f'手机 {SHOT_TIMEOUT} 秒没有回应')
+        except Exception as e:  # noqa: BLE001
+            last = e
+        if i == 1:
+            adb_reconnect(adb)
+    raise RuntimeError(f'试了 {tries} 次都失败（{last}）。检查 USB 线、手机是否解锁亮着')
+
+
+def keep_awake(adb):
+    """接着 USB 时让手机不要休眠（屏幕暗掉时截图常会卡住）。回传原本的设定，结束时用 restore_awake 还原。"""
+    try:
+        old = subprocess.run([adb, 'shell', 'settings', 'get', 'global', 'stay_on_while_plugged_in'],
+                             capture_output=True, text=True, timeout=8).stdout.strip()
+        subprocess.run([adb, 'shell', 'svc', 'power', 'stayon', 'usb'], capture_output=True, timeout=8)
+        return old
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def restore_awake(adb, old):
+    if old is None or not old.strip().isdigit():
+        return
+    try:
+        subprocess.run([adb, 'shell', 'settings', 'put', 'global', 'stay_on_while_plugged_in', old.strip()],
+                       capture_output=True, timeout=8)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def screenshot_png(adb, timeout=None):
+    r = subprocess.run([adb, 'exec-out', 'screencap', '-p'], capture_output=True, timeout=timeout or SHOT_TIMEOUT)
     data = r.stdout
     if not data.startswith(b'\x89PNG'):
         # 某些旧手机 / Windows 会把 \n 换成 \r\n
