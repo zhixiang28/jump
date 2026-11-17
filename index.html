@@ -1,167 +1,381 @@
 <!DOCTYPE html>
-<html lang="zh">
-<head>
+<html lang="zh"><head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
-<title>跳一跳 实时提示</title>
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<title>Servo Press · 相机测距</title>
 <style>
-  :root{--bg:#0b120e;--ink:#eaf5ee;--mute:#9bb5a4;--acc:#4ade80;--yel:#facc15;--blue:#60a5fa;--red:#f87171}
-  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent;user-select:none;-webkit-user-select:none}
-  html,body{margin:0;height:100%;background:var(--bg);color:var(--ink);font:14px/1.4 -apple-system,"PingFang SC","Noto Sans SC",sans-serif;overflow:hidden}
-  #app{display:flex;flex-direction:column;height:100%}
-  #view{position:relative;flex:1;min-height:0;background:#000;touch-action:none}
-  video,#frz,#ov{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
-  #frz{display:none}
-  #ov{pointer-events:none}
-  #msg{position:absolute;left:8px;right:8px;top:8px;background:rgba(0,0,0,.6);padding:6px 10px;border-radius:10px;color:var(--yel);font-weight:600;text-align:center}
-  #ms{position:absolute;right:10px;bottom:10px;background:rgba(0,0,0,.65);padding:4px 12px;border-radius:12px;font-size:30px;font-weight:800;color:var(--yel)}
-  #bar{display:flex;gap:6px;padding:6px;background:#111c15}
-  #bar button{flex:1;border:0;border-radius:10px;padding:9px 4px;font:inherit;font-weight:700;background:#25392c;color:var(--ink)}
-  #bar button.pri{background:var(--acc);color:#06210f}
-  #bar button.blue{background:var(--blue);color:#061528}
-  #pad{height:26vh;margin:0 6px 6px;border-radius:18px;background:#25392c;position:relative;overflow:hidden;display:flex;flex-direction:column;align-items:center;justify-content:center;touch-action:none}
-  #pad.go{background:var(--acc)} #pad.go *{color:#06210f!important}
-  #fill{position:absolute;left:0;bottom:0;width:100%;height:0;background:rgba(250,204,21,.28)}
-  #padTxt{position:relative;font-size:28px;font-weight:800}
-  #padSub{position:relative;color:var(--mute);font-size:13px}
-  #kbox{position:absolute;left:10px;bottom:10px;background:rgba(0,0,0,.65);padding:3px 8px;border-radius:8px;color:var(--mute);font-size:12px}
-  #start{position:absolute;inset:0;display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;background:var(--bg);z-index:5;padding:24px;text-align:center}
-  #start button{border:0;border-radius:14px;padding:14px 22px;font:inherit;font-size:17px;font-weight:800;background:var(--acc);color:#06210f}
-  #start p{color:var(--mute);margin:0}
-</style>
-</head>
-<body>
-<div id="app">
-  <div id="view">
-    <video id="vid" playsinline muted autoplay></video>
-    <canvas id="frz"></canvas>
-    <svg id="ov"></svg>
-    <div id="msg">…</div>
-    <div id="ms">— ms</div>
-    <div id="kbox">k=—</div>
-    <div id="start">
-      <div style="font-size:22px;font-weight:800">🦌 跳一跳 实时提示</div>
-      <p>把这部手机架在游戏手机上方，镜头对准游戏画面，尽量正对、别晃。</p>
-      <button id="go">打开相机</button>
-      <p id="err" style="color:#f87171"></p>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:system-ui;background:#111;color:#eee}
+  header{display:flex;align-items:center;gap:8px;padding:10px 12px}
+  header b{flex:1;font-size:17px}
+  button{border:0;border-radius:10px;padding:10px 14px;font-size:16px;background:#2d6cdf;color:#fff}
+  button.sec{background:#333}
+  button.on{background:#2a9d55}
+  button:active{transform:scale(.96)}
+  button:disabled{opacity:.4}
+  #wrap{position:relative;width:100%;background:#000;touch-action:none;min-height:120px}
+  video{width:100%;display:block}
+  canvas{position:absolute;inset:0;width:100%;height:100%}
+  #tip{position:absolute;left:8px;top:8px;right:8px;background:#000a;padding:6px 10px;border-radius:8px;font-size:15px;pointer-events:none}
+  .modes{display:flex;gap:8px;padding:10px 12px 0}
+  .modes button{flex:1}
+  #big{display:flex;align-items:center;justify-content:space-between;padding:12px}
+  #ms{font-size:40px;font-weight:700;line-height:1.1}
+  #ms small{font-size:15px;color:#aaa;font-weight:400}
+  #press{font-size:22px;padding:16px 26px}
+  .fb{display:flex;gap:8px;padding:0 12px}
+  .fb button{flex:1;padding:14px 6px;font-size:17px}
+  #less{background:#b5462f} #more{background:#b5892f} #ok{background:#2a9d55}
+  #st{padding:8px 12px 0;color:#7c7;min-height:24px}
+  .card{background:#1d1d1d;border-radius:12px;padding:12px;margin:10px 12px}
+  .row{display:flex;gap:8px;align-items:center;margin:8px 0;flex-wrap:wrap}
+  input[type=number]{width:90px;font-size:17px;padding:8px;border-radius:8px;border:0}
+  label{font-size:15px}
+  summary{font-weight:700}
+  small.g{color:#888}
+  .ang{display:flex;align-items:center;gap:6px;margin:10px 0}
+  .ang span{width:34px;font-size:15px}
+  .ang input[type=range]{flex:1;accent-color:#2d6cdf;height:28px}
+  .ang input[type=number]{width:62px}
+  .pm{padding:8px 12px;font-size:18px}
+</style></head><body>
+
+<header>
+  <b>Servo Press</b>
+  <button id="cam" class="sec">开相机</button>
+  <button id="conn">连接蓝牙</button>
+</header>
+
+<div id="wrap">
+  <video id="v" playsinline muted autoplay></video><canvas id="c"></canvas>
+  <div id="tip">先开相机</div>
+</div>
+
+<div class="modes">
+  <button id="mFrame" class="sec">① 画手机边框</button>
+  <button id="mLine" class="sec">② 画距离</button>
+</div>
+
+<div id="big">
+  <div id="ms">— <small>ms</small><br><small id="dist">&nbsp;</small></div>
+  <button id="press">按！</button>
+</div>
+
+<div class="fb">
+  <button id="less">按太久 −</button>
+  <button id="ok">刚好 ✓</button>
+  <button id="more">按太短 +</button>
+</div>
+<div id="st"></div>
+
+<div class="card">
+  <div class="row">
+    <label><input id="auto" type="checkbox"> 画完自动按</label>
+  </div>
+  <small class="g" id="info"></small>
+</div>
+
+<div class="card">
+  <details>
+    <summary>进阶设定</summary>
+    <div class="row">
+      <label>屏幕比例 (高÷宽) <input id="ar" type="number" step="0.01"></label>
     </div>
+    <div class="row">
+      <label>k <input id="k" type="number" step="0.01"></label>
+      <label>b (ms) <input id="b" type="number" step="10"></label>
+      <button class="sec" id="resetStep">重置调整幅度</button>
+    </div>
+    <small class="g">按压时间 = 距离 × k + b。距离单位：手机屏幕宽 = 1000。</small>
+    <div class="row">
+      <input id="manual" type="number" placeholder="手动 ms">
+      <button class="sec" id="go">手动按</button>
+    </div>
+  </details>
+</div>
+
+<div class="card">
+  <b>Servo 角度</b>
+  <small class="g">（拖动时 servo 会跟着转，调好按保存）</small>
+  <div class="ang">
+    <span>静止</span>
+    <button class="sec pm" data-t="ra" data-d="-1">−</button>
+    <input id="raS" type="range" min="0" max="180">
+    <button class="sec pm" data-t="ra" data-d="1">＋</button>
+    <input id="ra" type="number" min="0" max="180">
   </div>
-  <div id="bar">
-    <button id="edge" class="blue">设边框</button>
-    <button id="short">近了</button>
-    <button id="ok" class="pri">刚好</button>
-    <button id="long">远了</button>
-    <button id="snd">🔊</button>
+  <div class="ang">
+    <span>压下</span>
+    <button class="sec pm" data-t="pa" data-d="-1">−</button>
+    <input id="paS" type="range" min="0" max="180">
+    <button class="sec pm" data-t="pa" data-d="1">＋</button>
+    <input id="pa" type="number" min="0" max="180">
   </div>
-  <div id="pad"><div id="fill"></div><div id="padTxt">按住</div><div id="padSub">和游戏同时按，“嘀”就一起松</div></div>
+  <div class="row">
+    <button class="sec" id="toRest">去静止位</button>
+    <button class="sec" id="toPush">去压下位</button>
+    <button class="sec" id="tryP">试按 300ms</button>
+    <button id="saveA">保存</button>
+  </div>
+  <small class="g" id="angSt">未连接时显示的是上次保存的值</small>
 </div>
 
 <script>
+const SVC='6e400001-b5a3-f393-e0a9-e50e24dcca9e',
+      RX ='6e400002-b5a3-f393-e0a9-e50e24dcca9e',
+      TX ='6e400003-b5a3-f393-e0a9-e50e24dcca9e';
 const $=id=>document.getElementById(id);
-const store={get(k,d){try{const v=localStorage.getItem(k);return v==null?d:JSON.parse(v)}catch(e){return d}},set(k,v){try{localStorage.setItem(k,JSON.stringify(v))}catch(e){}}};
-const vid=$('vid'),frz=$('frz'),ov=$('ov'),view=$('view');
-let K=store.get('jumpK',1500), edges=store.get('jumpEdges',null); // edges in video-normalized coords
-let mode=edges?'jump':'edge', tmp=[], jumpPts=[], T=null, sound=true;
+const v=$('v'), c=$('c'), ctx=c.getContext('2d');
+const store={get(k,d){try{const x=localStorage.getItem('sp_'+k);return x===null?d:JSON.parse(x)}catch{return d}},
+             set(k,x){try{localStorage.setItem('sp_'+k,JSON.stringify(x))}catch{}}};
+const st=t=>$('st').textContent=t;
 
-// ---------- camera ----------
-$('go').onclick=async()=>{
-  ensureAudio();
+// ---------- 状态 ----------
+let rx=null;
+let mode='frame';
+let corners=store.get('corners',[]);   // 归一化画面坐标 [{x,y}] ×4：左上 右上 右下 左下
+let H=null;                            // 画面 → 手机屏幕坐标 的透视矩阵
+let line=null, drag=null, dragCorner=-1;
+let units=0, curMs=0;
+let last={ms:0,units:0};               // 上一次「用线」按的
+let step=store.get('step',0.10), lastDir=0;
+
+$('k').value=store.get('k',1.0);
+$('b').value=store.get('b',0);
+$('ar').value=store.get('ar',2.17);
+$('auto').checked=store.get('auto',false);
+$('k').onchange=()=>{store.set('k',+$('k').value);calc();info()};
+$('b').onchange=()=>{store.set('b',+$('b').value);calc();info()};
+$('ar').onchange=()=>{store.set('ar',+$('ar').value);buildH();calc()};
+$('auto').onchange=()=>store.set('auto',$('auto').checked);
+
+// ---------- 相机 ----------
+$('cam').onclick=async()=>{
   try{
-    const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}},audio:false});
-    vid.srcObject=s;await vid.play();$('start').style.display='none';
-    try{const tr=s.getVideoTracks()[0];const c=tr.getCapabilities?tr.getCapabilities():{};if(c.focusMode&&c.focusMode.includes('continuous'))tr.applyConstraints({advanced:[{focusMode:'continuous'}]});}catch(e){}
-    refresh();
-  }catch(e){$('err').textContent='打不开相机：'+(e.message||e.name)+'。要用 https 网址打开（比如 GitHub Pages），并允许相机权限。';}
+    const s=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment',width:{ideal:1280}},audio:false});
+    v.srcObject=s; await v.play(); $('cam').textContent='相机 ✓';
+    setMode(corners.length===4?'line':'frame');
+  }catch(e){st('相机打不开：'+e.message+'（要用 HTTPS 网址打开）')}
+};
+function resize(){const r=c.getBoundingClientRect();c.width=r.width*devicePixelRatio;c.height=r.height*devicePixelRatio;draw()}
+addEventListener('resize',resize); v.onloadedmetadata=()=>{resize();buildH()};
+
+// ---------- 模式 ----------
+function setMode(m){
+  mode=m;
+  $('mFrame').className=m==='frame'?'on':'sec';
+  $('mLine').className=m==='line'?'on':'sec';
+  tip(); draw();
+}
+$('mFrame').onclick=()=>{
+  if(mode==='frame'&&corners.length===4){ if(confirmReset())return; }
+  setMode('frame');
+};
+$('mLine').onclick=()=>{ if(corners.length<4){st('先点完手机屏幕 4 个角');return} setMode('line'); };
+function confirmReset(){ // 已经在边框模式再按一次 = 清掉重画
+  corners=[];H=null;store.set('corners',corners);tip();draw();st('边框已清除，重新点 4 个角');return true;
+}
+const NAMES=['左上','右上','右下','左下'];
+function tip(){
+  let t;
+  if(!v.srcObject) t='先开相机';
+  else if(mode==='frame') t=corners.length<4
+      ? `点手机屏幕的【${NAMES[corners.length]}】角 (${corners.length+1}/4)`
+      : '边框好了 ✓ 可以拖角微调；再按「①」可清除重画';
+  else t='从起点拉到终点';
+  $('tip').textContent=t;
+}
+
+// ---------- 透视 (4 点 homography) ----------
+function solve(A,b){ // 高斯消去
+  const n=b.length;
+  for(let i=0;i<n;i++){
+    let p=i; for(let r=i+1;r<n;r++) if(Math.abs(A[r][i])>Math.abs(A[p][i])) p=r;
+    [A[i],A[p]]=[A[p],A[i]]; [b[i],b[p]]=[b[p],b[i]];
+    if(Math.abs(A[i][i])<1e-12) return null;
+    for(let r=i+1;r<n;r++){const f=A[r][i]/A[i][i]; for(let k=i;k<n;k++)A[r][k]-=f*A[i][k]; b[r]-=f*b[i];}
+  }
+  const x=Array(n).fill(0);
+  for(let i=n-1;i>=0;i--){let s=b[i]; for(let k=i+1;k<n;k++)s-=A[i][k]*x[k]; x[i]=s/A[i][i];}
+  return x;
+}
+function vidPx(p){return{x:p.x*(v.videoWidth||16),y:p.y*(v.videoHeight||9)}}
+function buildH(){
+  if(corners.length!==4){H=null;return}
+  const ar=+$('ar').value||2.17;
+  const dst=[[0,0],[1000,0],[1000,1000*ar],[0,1000*ar]];
+  const A=[],b=[];
+  corners.forEach((p,i)=>{
+    const {x,y}=vidPx(p), [u,w]=dst[i];
+    A.push([x,y,1,0,0,0,-u*x,-u*y]); b.push(u);
+    A.push([0,0,0,x,y,1,-w*x,-w*y]); b.push(w);
+  });
+  const h=solve(A,b); H=h?[...h,1]:null;
+}
+function toScreen(p){ // 归一化画面坐标 → 手机屏幕坐标 (宽 1000)
+  const {x,y}=vidPx(p), w=H[6]*x+H[7]*y+H[8];
+  return{x:(H[0]*x+H[1]*y+H[2])/w, y:(H[3]*x+H[4]*y+H[5])/w};
+}
+
+// ---------- 触控 ----------
+function pt(e){const r=c.getBoundingClientRect();return{x:(e.clientX-r.left)/r.width,y:(e.clientY-r.top)/r.height}}
+function nearCorner(p){
+  const r=c.getBoundingClientRect();
+  let best=-1,bd=30;
+  corners.forEach((q,i)=>{const d=Math.hypot((q.x-p.x)*r.width,(q.y-p.y)*r.height); if(d<bd){bd=d;best=i}});
+  return best;
+}
+c.onpointerdown=e=>{
+  if(!v.srcObject)return;
+  c.setPointerCapture(e.pointerId);
+  const p=pt(e);
+  if(mode==='frame'){
+    dragCorner=nearCorner(p);
+    if(dragCorner<0&&corners.length<4){corners.push(p);dragCorner=corners.length-1;}
+    afterCorner();
+  }else{
+    drag={a:p,b:p}; line=drag; draw();
+  }
+};
+c.onpointermove=e=>{
+  const p=pt(e);
+  if(mode==='frame'&&dragCorner>=0){corners[dragCorner]=p;afterCorner();}
+  else if(drag){drag.b=p;calc();draw();}
+};
+c.onpointerup=()=>{
+  if(mode==='frame'){
+    dragCorner=-1; store.set('corners',corners);
+    if(corners.length===4&&!line){setTimeout(()=>setMode('line'),400)}
+    return;
+  }
+  if(!drag)return;
+  drag=null; calc(); draw();
+  if($('auto').checked&&units>5) pressLine();
+};
+function afterCorner(){buildH();calc();tip();draw();}
+
+// ---------- 计算 ----------
+function calc(){
+  if(!line||!H){units=0;curMs=0;showMs();return}
+  const a=toScreen(line.a), b=toScreen(line.b);
+  units=Math.hypot(b.x-a.x,b.y-a.y);
+  curMs=Math.max(0,Math.round(units*+$('k').value+ +$('b').value));
+  showMs();
+}
+function showMs(){
+  $('ms').innerHTML=units?`${curMs} <small>ms</small><br><small>距离 ${units.toFixed(0)}（屏宽=1000）</small>`
+                         :`— <small>ms</small><br><small>&nbsp;</small>`;
+}
+function info(){$('info').textContent=`k = ${(+$('k').value).toFixed(3)}，b = ${+$('b').value} ms，下次调整幅度 ±${(step*100).toFixed(1)}%`}
+
+// ---------- 画 ----------
+function draw(){
+  ctx.clearRect(0,0,c.width,c.height);
+  const W=c.width,Hh=c.height,d=devicePixelRatio;
+  if(corners.length){
+    ctx.strokeStyle='#33d6ff'; ctx.lineWidth=3*d; ctx.beginPath();
+    corners.forEach((p,i)=>i?ctx.lineTo(p.x*W,p.y*Hh):ctx.moveTo(p.x*W,p.y*Hh));
+    if(corners.length===4)ctx.closePath(); ctx.stroke();
+    ctx.font=`${13*d}px system-ui`;
+    corners.forEach((p,i)=>{
+      ctx.fillStyle='#33d6ff'; ctx.beginPath(); ctx.arc(p.x*W,p.y*Hh,(mode==='frame'?10:5)*d,0,7); ctx.fill();
+      if(mode==='frame'){ctx.fillStyle='#000';ctx.fillText(i+1,p.x*W-4*d,p.y*Hh+4*d)}
+    });
+  }
+  if(line){
+    const a={x:line.a.x*W,y:line.a.y*Hh},b={x:line.b.x*W,y:line.b.y*Hh};
+    ctx.lineWidth=4*d; ctx.strokeStyle='#ffdd33';
+    ctx.beginPath();ctx.moveTo(a.x,a.y);ctx.lineTo(b.x,b.y);ctx.stroke();
+    for(const[p,col]of[[a,'#3c9'],[b,'#f55']]){ctx.fillStyle=col;ctx.beginPath();ctx.arc(p.x,p.y,8*d,0,7);ctx.fill()}
+  }
+}
+
+// ---------- 快/慢 校准 ----------
+// 每次按「太久/太短」：把上一次的按压时间 ±step，反推新的 k。
+// 方向跟上次相反 → step 减半（逐步逼近）。
+function feedback(dir){
+  if(!last.units){st('先用「画距离」按一次，再告诉我快了还是慢了');return}
+  if(lastDir&&dir!==lastDir) step=Math.max(0.01,step/2);
+  lastDir=dir;
+  const b=+$('b').value, newMs=last.ms*(1+dir*step);
+  const k=Math.max(0.001,(newMs-b)/last.units);
+  $('k').value=k.toFixed(4); store.set('k',k); store.set('step',step);
+  st(`${dir<0?'缩短':'加长'} ${(step*100).toFixed(1)}%：刚才那条线下次会按 ${Math.round(newMs)} ms`);
+  calc(); info();
+}
+$('less').onclick=()=>feedback(-1);
+$('more').onclick=()=>feedback(+1);
+$('ok').onclick=()=>{step=Math.max(0.01,step/2);lastDir=0;store.set('step',step);st('👍 收窄调整幅度');info()};
+$('resetStep').onclick=()=>{step=0.10;lastDir=0;store.set('step',step);info();st('调整幅度重置为 ±10%')};
+
+// ---------- 蓝牙 ----------
+$('conn').onclick=async()=>{
+  if(!navigator.bluetooth){st('这个浏览器不支持 Web Bluetooth（用 Android / 电脑 Chrome；iPhone 用 Bluefy）');return}
+  try{
+    st('搜索中…');
+    const dev=await navigator.bluetooth.requestDevice({filters:[{services:[SVC]}]});
+    dev.addEventListener('gattserverdisconnected',()=>{rx=null;$('conn').className='';$('conn').textContent='连接蓝牙';st('蓝牙断开')});
+    const s=await (await dev.gatt.connect()).getPrimaryService(SVC);
+    rx=await s.getCharacteristic(RX);
+    const tx=await s.getCharacteristic(TX);
+    await tx.startNotifications();
+    tx.addEventListener('characteristicvaluechanged',e=>{
+      const m=new TextDecoder().decode(e.target.value);
+      if(m[0]==='D')st(`已回弹 ✓（${m.slice(1)} ms）结果怎样？用下面按钮告诉我`);
+      if(m[0]==='A'){const[r,p]=m.slice(1).split(',');setAng('ra',+r,false);setAng('pa',+p,false);$('angSt').textContent=`板子上的设定：静止 ${r}°，压下 ${p}°`}
+    });
+    $('conn').className='on';$('conn').textContent='已连接';st('已连接 '+dev.name);
+    send('G');
+  }catch(e){st('连接失败：'+e.message)}
+};
+async function send(cmd){
+  if(!rx){st('还没连接蓝牙');return false}
+  try{await rx.writeValueWithResponse(new TextEncoder().encode(cmd));return true}
+  catch(e){st('发送失败：'+e.message);return false}
+}
+async function press(ms){
+  ms=Math.round(ms); if(!(ms>0)){st('按压时间要大于 0');return false}
+  if(await send('P'+ms)){st('按 '+ms+' ms…');return true}
+  return false;
+}
+async function pressLine(){
+  if(!units){st('先画一条线');return}
+  if(await press(curMs)) last={ms:curMs,units};
+}
+$('press').onclick=pressLine;
+$('go').onclick=()=>press(+$('manual').value);
+// ---------- Servo 角度 ----------
+// 拖动时连续发 M<角度>；蓝牙一次只能送一个，忙的时候只留最新值
+let liveBusy=false, livePending=null;
+async function live(a){
+  if(!rx)return;
+  if(liveBusy){livePending=a;return}
+  liveBusy=true;
+  try{await rx.writeValueWithResponse(new TextEncoder().encode('M'+a))}catch(e){}
+  liveBusy=false;
+  if(livePending!==null){const n=livePending;livePending=null;live(n)}
+}
+function setAng(id,a,move=true){
+  a=Math.max(0,Math.min(180,Math.round(a)||0));
+  $(id).value=a; $(id+'S').value=a; store.set(id,a);
+  if(move) live(a);
+}
+setAng('ra',store.get('ra',0),false); setAng('pa',store.get('pa',90),false);
+['ra','pa'].forEach(id=>{
+  $(id+'S').oninput=()=>setAng(id,+$(id+'S').value);
+  $(id).onchange=()=>setAng(id,+$(id).value);
+});
+document.querySelectorAll('.pm').forEach(b=>b.onclick=()=>setAng(b.dataset.t,+$(b.dataset.t).value+ +b.dataset.d));
+$('toRest').onclick=()=>live(+$('ra').value);
+$('toPush').onclick=()=>live(+$('pa').value);
+$('saveA').onclick=async()=>{
+  if(await send(`A${+$('ra').value},${+$('pa').value}`)) st('角度已保存到板子 ✓');
+};
+$('tryP').onclick=async()=>{
+  // 先存再试，确保用的是现在的角度
+  if(await send(`A${+$('ra').value},${+$('pa').value}`)) setTimeout(()=>press(300),150);
 };
 
-// displayed video rect (object-fit:contain)
-function vrect(){
-  const W=view.clientWidth,H=view.clientHeight,vw=vid.videoWidth||16,vh=vid.videoHeight||9;
-  const s=Math.min(W/vw,H/vh),w=vw*s,h=vh*s;return{x:(W-w)/2,y:(H-h)/2,w,h,vw,vh};
-}
-function toNorm(cx,cy){const b=view.getBoundingClientRect(),r=vrect();return{x:(cx-b.left-r.x)/r.w,y:(cy-b.top-r.y)/r.h};}
-function toScr(p){const r=vrect();return{x:r.x+p.x*r.w,y:r.y+p.y*r.h};}
-function dist(a,b){const r=vrect();return Math.hypot((b.x-a.x)*r.vw,(b.y-a.y)*r.vh);} // in video pixels
-
-function freeze(){const r=vrect();frz.width=view.clientWidth;frz.height=view.clientHeight;const c=frz.getContext('2d');c.clearRect(0,0,frz.width,frz.height);c.drawImage(vid,r.x,r.y,r.w,r.h);frz.style.display='block';}
-function unfreeze(){frz.style.display='none';}
-
-view.addEventListener('pointerdown',e=>{
-  if($('start').style.display!=='none')return;
-  const p=toNorm(e.clientX,e.clientY);if(p.x<0||p.x>1||p.y<0||p.y>1)return;
-  if(mode==='edge'){
-    tmp.push(p);
-    if(tmp.length===2){edges=tmp;tmp=[];store.set('jumpEdges',edges);mode='jump';}
-  }else{
-    if(jumpPts.length>=2)jumpPts=[];
-    if(jumpPts.length===0)freeze();
-    jumpPts.push(p);
-    if(jumpPts.length===2){
-      const w=dist(edges[0],edges[1]);
-      if(w<20){mode='edge';edges=null;jumpPts=[];unfreeze();refresh();return;}
-      const frac=dist(jumpPts[0],jumpPts[1])/w;
-      T=Math.round(K*frac);T0frac=frac;
-      setTimeout(unfreeze,250);
-    }
-  }
-  refresh();
-});
-let T0frac=null;
-
-$('edge').onclick=()=>{mode='edge';tmp=[];jumpPts=[];unfreeze();refresh();};
-
-function refresh(){
-  const m=$('msg');
-  if(mode==='edge')m.textContent=tmp.length===0?'设边框：点游戏画面左边缘':'再点游戏画面右边缘（同一高度）';
-  else if(jumpPts.length===0)m.textContent='点角色脚底（画面会暂停）';
-  else if(jumpPts.length===1)m.textContent='点目标平台顶面中心';
-  else m.textContent=`距离 ${(T0frac*100).toFixed(0)}% 屏宽 → 按 ${(T/1000).toFixed(2)} 秒`;
-  $('ms').textContent=T?T+' ms':'— ms';
-  $('kbox').textContent='k='+K;
-  drawOv();
-}
-function drawOv(){
-  ov.setAttribute('viewBox',`0 0 ${view.clientWidth} ${view.clientHeight}`);
-  let s='';const dot=(p,c)=>{const q=toScr(p);return`<circle cx="${q.x}" cy="${q.y}" r="9" fill="${c}" stroke="#fff" stroke-width="2"/>`};
-  const ln=(a,b,c)=>{const p=toScr(a),q=toScr(b);return`<line x1="${p.x}" y1="${p.y}" x2="${q.x}" y2="${q.y}" stroke="${c}" stroke-width="3" stroke-dasharray="6 5"/>`};
-  const E=mode==='edge'?tmp:(edges||[]);
-  if(E.length===2)s+=ln(E[0],E[1],'#60a5fa');E.forEach(p=>s+=dot(p,'#60a5fa'));
-  if(jumpPts.length===2)s+=ln(jumpPts[0],jumpPts[1],'#facc15');
-  jumpPts.forEach((p,i)=>s+=dot(p,i?'#facc15':'#f87171'));
-  ov.innerHTML=s;
-}
-window.addEventListener('resize',refresh);
-
-// ---------- calibration ----------
-function setK(v){K=Math.round(Math.max(300,Math.min(5000,v)));store.set('jumpK',K);if(T0frac!=null)T=Math.round(K*T0frac);refresh();}
-$('short').onclick=()=>{setK(K*1.06);jumpPts=[];T=null;T0frac=null;refresh();};
-$('long').onclick=()=>{setK(K*0.94);jumpPts=[];T=null;T0frac=null;refresh();};
-$('ok').onclick=()=>{jumpPts=[];T=null;T0frac=null;refresh();};
-$('snd').onclick=()=>{sound=!sound;$('snd').textContent=sound?'🔊':'🔇';};
-
-// ---------- cue pad ----------
-let actx=null,t0=0,raf=0,down=false,fired=false,timer=0;
-function ensureAudio(){try{if(!actx)actx=new (window.AudioContext||window.webkitAudioContext)();if(actx.state==='suspended')actx.resume();}catch(e){}}
-function beep(){if(!sound||!actx)return;try{const o=actx.createOscillator(),g=actx.createGain();o.type='square';o.frequency.value=1760;g.gain.setValueAtTime(0.0001,actx.currentTime);g.gain.exponentialRampToValueAtTime(0.5,actx.currentTime+0.005);g.gain.exponentialRampToValueAtTime(0.0001,actx.currentTime+0.15);o.connect(g).connect(actx.destination);o.start();o.stop(actx.currentTime+0.16);}catch(e){}}
-const pad=$('pad'),fill=$('fill');
-function loop(){const el=performance.now()-t0;fill.style.height=Math.min(100,el/T*100)+'%';$('padTxt').textContent=Math.round(el)+' ms';raf=requestAnimationFrame(loop);}
-function fire(){if(!down||fired)return;fired=true;beep();pad.classList.add('go');$('padSub').textContent='松手！';try{navigator.vibrate&&navigator.vibrate(60)}catch(e){}}
-pad.addEventListener('pointerdown',e=>{
-  e.preventDefault();ensureAudio();
-  if(!T){$('padSub').textContent='先在画面上点角色和目标';return;}
-  try{pad.setPointerCapture(e.pointerId)}catch(_){}
-  down=true;fired=false;pad.classList.remove('go');t0=performance.now();$('padSub').textContent='等“嘀”…';
-  clearTimeout(timer);timer=setTimeout(fire,Math.max(0,T-10));loop();
-});
-function up(){
-  if(!down)return;down=false;clearTimeout(timer);cancelAnimationFrame(raf);
-  const el=Math.round(performance.now()-t0),d=el-T;fill.style.height='0';pad.classList.remove('go');
-  $('padTxt').textContent=el+' ms';
-  $('padSub').textContent=(Math.abs(d)<=Math.max(40,T*0.06)?'🎯 很准':d<0?'⬇️ 松早了':'⬆️ 松晚了')+`（${d>0?'+':''}${d} ms）→ 跳完按 近了/刚好/远了`;
-}
-pad.addEventListener('pointerup',up);pad.addEventListener('pointercancel',up);
-document.addEventListener('contextmenu',e=>e.preventDefault());
-refresh();
+info(); tip(); showMs();
 </script>
-</body>
-</html>
+</body></html>
