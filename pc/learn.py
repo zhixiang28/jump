@@ -750,21 +750,54 @@ def _robust_lstsq(X, y, min_keep):
     return w, keep
 
 
-def fit_land(store, n=80):
-    """用量到的落点拟合：按了 ms → 实际跳了 traveled。
-    基本：ms = k × traveled + b。资料够多时，再试「左右方向修正」和「小人高度修正」，
-    用一半资料学、另一半测（两种分法都做），真的比较准才采用，避免学到杂讯。"""
-    rs = [r for r in store.recs if r.get('land')][-n:]
+K_RANGE, B_RANGE = (0.6, 2.0), (-50.0, 450.0)     # k、b 的合理范围
+K_DEFAULT, B_DEFAULT = 1.0, 200                     # 设定不合理时重设的值（之前几次资料大约 k≈1.0、b≈50~270）
+
+
+def sane_calibration(cfg):
+    """k、b 在合理范围内吗？（学坏的例子：k = 0.30、b = 524，等于不管多远都按差不多久）"""
+    return K_RANGE[0] <= cfg.get('k', 0) <= K_RANGE[1] and B_RANGE[0] <= cfg.get('b', 0) <= B_RANGE[1]
+MS_SPREAD_FOR_B = 150                                # 按压时间至少要有这么大的差别，才重新估 b
+
+
+def _land_recs(store, cfg, n):
+    since = (cfg or {}).get('calib_since', 0) or 0   # 「调整了装置」之后的资料才算
+    return [r for r in store.recs if r.get('land') and (r.get('t_press') or 0) >= since][-n:]
+
+
+def fit_land(store, n=80, cfg=None):
+    """用量到的落点拟合按压时间。
+    注意方向：按压时间是程序精确控制的（没有误差），误差都在「实际跳了多远」，
+    所以要拟合「跳多远 = a × ms + c」再换算回 ms = k × 距离 + b（k = 1/a）。
+    反过来拟合会让 k 系统性偏小、越学越歪。
+    按压时间的范围不够大时，b 估不准：这时只估 k、b 沿用目前的值。
+    资料够多时，再试「左右方向修正」和「小人高度修正」，用一半资料学、另一半测，真的比较准才采用。"""
+    cfg = cfg or {}
+    rs = _land_recs(store, cfg, n)
     if len(rs) < MIN_LAND:
         return None
-    x = np.array([r['land']['traveled'] for r in rs], float)
-    y = np.array([r['ms'] for r in rs], float)
-    if x.max() - x.min() < 80:
-        return None
+    t = np.array([r['land']['traveled'] for r in rs], float)
+    ms = np.array([r['ms'] for r in rs], float)
     side = np.array([_jump_side(r) for r in rs])
     fy = np.array([r['a'][1] for r in rs], float)
     f0 = float(np.median(fy))
-    cols = {'base': [x, np.ones_like(x)]}
+    if ms.max() - ms.min() < MS_SPREAD_FOR_B:
+        b = float(cfg.get('b', 150))
+        u = ms - b - cfg.get('k_side', 0) * side - cfg.get('k_foot', 0) * (fy - cfg.get('foot0', f0))
+        keep = np.ones(len(t), bool)
+        for _ in range(2):
+            a = float((u[keep] * t[keep]).sum() / max(1e-6, (u[keep] ** 2).sum()))
+            res = np.abs(a * u - t)
+            keep = res <= max(3 * np.median(res[keep]), 15)
+        if a <= 0:
+            return None
+        k = 1.0 / a
+        rms_t = float(np.sqrt(((a * u[keep] - t[keep]) ** 2).mean()))
+        return {'k': k, 'b': b, 'k_side': cfg.get('k_side', 0.0), 'k_foot': cfg.get('k_foot', 0.0),
+                'foot0': cfg.get('foot0', f0), 'terms': 'k-only', 'rms': rms_t * k, 'cv': rms_t * k,
+                'n': int(keep.sum())}
+
+    cols = {'base': [ms, np.ones_like(ms)]}
     if len(rs) >= 30 and (side > 0).sum() >= 8 and (side < 0).sum() >= 8:
         cols['side'] = cols['base'] + [side]
         if len(rs) >= 40:
@@ -772,32 +805,81 @@ def fit_land(store, n=80):
 
     def cv_rms(c):
         X = np.vstack(c).T
-        idx = np.arange(len(y))
+        idx = np.arange(len(t))
         errs = []
         for part in (idx % 2 == 0, idx % 2 == 1):
-            w, _ = _robust_lstsq(X[~part], y[~part], len(c) + 2)
+            w, _ = _robust_lstsq(X[~part], t[~part], len(c) + 2)
             if w is None:
                 return 1e9
-            r = X[part] @ w - y[part]
-            errs.append(np.abs(r))
+            errs.append(np.abs(X[part] @ w - t[part]))
         e = np.concatenate(errs)
-        e = e[e <= max(3 * np.median(e), 15)]           # 测试时也不算明显量错的
+        e = e[e <= max(3 * np.median(e), 15)]
         return float(np.sqrt((e ** 2).mean()))
 
     best, best_cv = 'base', cv_rms(cols['base'])
     for name in ('side', 'side+foot'):
         if name in cols:
             cv = cv_rms(cols[name])
-            if cv < best_cv * 0.95:                      # 至少准 5% 才值得多学一项
+            if cv < best_cv * 0.95:
                 best, best_cv = name, cv
     X = np.vstack(cols[best]).T
-    w, keep = _robust_lstsq(X, y, MIN_LAND)
+    w, keep = _robust_lstsq(X, t, MIN_LAND)
     if w is None or w[0] <= 0:
         return None
-    rms = float(np.sqrt(((X[keep] @ w - y[keep]) ** 2).mean()))
-    return {'k': float(w[0]), 'b': float(w[1]), 'k_side': float(w[2]) if len(w) > 2 else 0.0,
-            'k_foot': float(w[3]) if len(w) > 3 else 0.0, 'foot0': f0, 'terms': best,
-            'rms': rms, 'cv': best_cv, 'n': int(keep.sum())}
+    a, c = float(w[0]), float(w[1])
+    k, b = 1.0 / a, -c / a
+    rms_t = float(np.sqrt(((X[keep] @ w - t[keep]) ** 2).mean()))
+    return {'k': k, 'b': b, 'k_side': -float(w[2]) / a if len(w) > 2 else 0.0,
+            'k_foot': -float(w[3]) / a if len(w) > 3 else 0.0, 'foot0': f0, 'terms': best,
+            'rms': rms_t * k, 'cv': best_cv * k, 'n': int(keep.sum())}
+
+
+def calibration_update(store, cfg, rec):
+    """跳完量到落点后，算新的 k、b（含合理范围和每次最多变多少）。回传 (新参数 dict, 说明) 或 (None, '')。"""
+    f = fit_land(store, cfg=cfg)
+    fresh = len(_land_recs(store, cfg, 999)) < 15           # 刚重新校准：允许变化大一点
+    if f and f['rms'] < 30:
+        new = {'k': f['k'], 'b': f['b'], 'k_side': f['k_side'], 'k_foot': f['k_foot'], 'foot0': f['foot0']}
+        terms = {'base': '', 'side': ' + 左右修正', 'side+foot': ' + 左右修正 + 高度修正',
+                 'k-only': '（只调 k）'}[f['terms']]
+        how = f'（{f["n"]} 跳拟合{terms}，误差 ±{f["rms"]:.0f} ms）'
+    else:
+        traveled = rec['land']['traveled']
+        if traveled < 50:
+            return None, ''
+        corr = (cfg.get('k_side', 0) * _jump_side(rec) + cfg.get('k_foot', 0) * (rec['a'][1] - cfg.get('foot0', rec['a'][1])))
+        if fresh:
+            # 刚调整过装置：主要变的是触控笔的行程时间（b），先修 b，资料够了再一起拟合 k
+            miss = rec['ms'] - (cfg['k'] * traveled + cfg['b'] + corr)   # 这跳多按（+）或少按（−）了几 ms
+            new = {'k': cfg['k'], 'b': cfg['b'] + 0.7 * miss}
+            how = '（单跳修正 b）'
+        else:
+            k_true = (rec['ms'] - cfg['b'] - corr) / traveled
+            new = {'k': cfg['k'] + 0.6 * (k_true - cfg['k'])}
+            how = '（单跳修正）'
+    # 合理范围 + 每次最多变多少（避免一次量错或资料太少就大幅偏掉）
+    step = 0.35 if fresh else 0.15
+    k_old = cfg['k']
+    new['k'] = float(min(K_RANGE[1], max(K_RANGE[0], min(k_old * (1 + step), max(k_old * (1 - step), new['k'])))))
+    if 'b' in new:
+        b_old = cfg['b']
+        db = 120 if fresh else 40
+        new['b'] = float(min(B_RANGE[1], max(B_RANGE[0], min(b_old + db, max(b_old - db, new['b'])))))
+    new = {key: (round(v, 4) if key in ('k', 'foot0') else round(v, 1) if key in ('k_side', 'k_foot') else round(v))
+           for key, v in new.items()}
+    return new, how
+
+
+def bias_alarm(store, cfg, n=5, thr=0.05):
+    """最近 n 跳的落点都往同一边偏超过 thr：装置可能变了（例如换了按压角度）。
+    触发后要再累积 10 跳以上才会再触发（不然会一直清掉资料、永远学不起来）。"""
+    if len(_land_recs(store, cfg, 999)) < 10:
+        return False
+    rs = _land_recs(store, cfg, n)
+    if len(rs) < n:
+        return False
+    pct = [(r['land']['err'] - (r.get('aim') or 0)) / max(1.0, r['land']['traveled'] - r['land']['err']) for r in rs]
+    return all(p > thr for p in pct) or all(p < -thr for p in pct)
 
 
 def land_stats(store, n=10):
