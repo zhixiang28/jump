@@ -1,4 +1,5 @@
 jump_config.json
 debug/
+data/
 __pycache__/
 platform-tools/

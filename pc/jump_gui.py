@@ -7,7 +7,10 @@
 
 快捷键：
   空白键 = 按       R = 重新截图       右键 = 清除线
-  1 = 太久          2 = 刚好           3 = 太短
+  1 = 太久          2 = 刚好           3 = 太短         Esc = 停止 AI 自动玩
+
+学习：你每画一条线按一次，都会记下来（pc/data/）。AI 会学小人的样子、跳跃角度和 k/b，
+     并在你玩的时候偷偷预测（紫色虚线），跟你画的比较；够准了再打开「AI 自动玩」。
 """
 import asyncio
 import math
@@ -20,6 +23,7 @@ from tkinter import messagebox
 from PIL import Image, ImageTk
 
 import jump_bot as jb
+import learn
 
 FONT = ('Microsoft YaHei UI', 11)
 FONT_B = ('Microsoft YaHei UI', 11, 'bold')
@@ -50,6 +54,10 @@ class App:
         self.last_dir = 0
         self.busy = False          # 正在按 / 等动画
         self.grabbing = False
+        self.store = learn.Store()
+        self.tpls = learn.build_templates(self.store)
+        self.pred = None           # AI 对目前画面的预测
+        self.cur_rec = None        # 上一次按压的学习纪录（等你按 1/2/3）
         self.build()
         self.root.after(50, self.poll)
         self.root.after(100, self.start)
@@ -128,6 +136,20 @@ class App:
                 self.cv.focus_set()
             e.bind('<Return>', save); e.bind('<FocusOut>', save)
             return e
+        lf = tk.Frame(p, bg='#24272e', padx=8, pady=6); lf.pack(fill='x', pady=(8, 0))
+        tk.Label(lf, text='🧠 学习', font=FONT_B, bg='#24272e', fg=TEXT).pack(anchor='w')
+        self.learn_lbl = tk.Label(lf, text='', font=('Microsoft YaHei UI', 10), bg='#24272e', fg=SUB,
+                                  justify='left', wraplength=320)
+        self.learn_lbl.pack(anchor='w')
+        lr = tk.Frame(lf, bg='#24272e'); lr.pack(fill='x', pady=(4, 0))
+        self.fit_btn = btn(lr, '套用拟合 k/b', self.apply_fit, font=FONT)
+        self.fit_btn.pack(side='left')
+        btn(lr, '清除学习', self.clear_learn, font=FONT).pack(side='left', padx=6)
+        self.v_play = tk.BooleanVar(value=False)
+        tk.Checkbutton(lf, text='AI 自动玩（Esc 停止）', variable=self.v_play, command=self.toggle_play, font=FONT_B,
+                       bg='#24272e', fg='#e9a0ff', selectcolor='#262a31', activebackground='#24272e',
+                       activeforeground='#e9a0ff', anchor='w').pack(fill='x', pady=(4, 0))
+
         tk.Label(p, text='', bg=PANEL).pack()
         self.e_k = entry('k', 'k')
         self.e_b = entry('b (ms)', 'b')
@@ -139,6 +161,7 @@ class App:
         self.info_lbl = tk.Label(p, text='', font=('Microsoft YaHei UI', 10), bg=PANEL, fg=SUB, justify='left')
         self.info_lbl.pack(anchor='w', pady=(6, 0))
         self.show_info()
+        self.update_learn()
 
         r.bind('<KeyPress>', self.on_key)
 
@@ -157,6 +180,8 @@ class App:
         elif k in ('1', 'kp_1'): self.feedback(-1)
         elif k in ('2', 'kp_2'): self.ok()
         elif k in ('3', 'kp_3'): self.feedback(1)
+        elif k == 'escape' and self.v_play.get():
+            self.v_play.set(False); self.status('⏸ AI 自动玩已停止', 'warn')
 
     # ------------------------------------------------------------ 背景工作
     def bg(self, fn, done):
@@ -218,7 +243,9 @@ class App:
         self.cv.delete('img')
         self.cv.create_image(0, 0, anchor='nw', image=self.photo, tags='img')
         self.cv.tag_lower('img')
+        self.pred = None
         self.draw()
+        self.predict_async()
 
     def live_tick(self):
         if self.v_live.get() and not self.drag and not self.busy:
@@ -296,6 +323,16 @@ class App:
     def draw(self):
         c, s = self.cv, self.scale
         c.delete('ov')
+        p = self.pred
+        if p and 'center' in p and self.img:
+            W = self.img.size[0]
+            F = (p['foot'][0] * W * s, p['foot'][1] * W * s)
+            C = (p['center'][0] * W * s, p['center'][1] * W * s)
+            c.create_line(*F, *C, fill='#e9a0ff', width=3, dash=(6, 4), tags='ov')
+            for (x, y) in (F, C):
+                c.create_oval(x - 6, y - 6, x + 6, y + 6, outline='#e9a0ff', width=3, tags='ov')
+            c.create_text(C[0], C[1] - 18, text=f'AI {p["ms"]} ms', fill='#e9a0ff',
+                          font=('Microsoft YaHei UI', 11, 'bold'), tags='ov')
         if not self.line:
             return
         (ax, ay), (bx, by) = self.line['a'], self.line['b']
@@ -338,6 +375,10 @@ class App:
             self.status('先用滑鼠从小人拉到目标', 'warn'); return
         if self.press(self.ms):
             self.last = {'ms': self.ms, 'units': self.units}
+            p = self.pred if self.pred and 'units' in self.pred else None
+            self.cur_rec = self.store.add(self.img, self.line['a'], self.line['b'], self.units, self.ms, pred=p)
+            self.tpls = learn.build_templates(self.store)     # 学新的小人样子
+            self.update_learn()
 
     def press(self, ms):
         if self.busy:
@@ -374,14 +415,111 @@ class App:
         self.cfg['k'] = round(max(0.01, (new_ms - self.cfg['b']) / self.last['units']), 4)
         jb.save_config(self.cfg)
         self.e_k.delete(0, 'end'); self.e_k.insert(0, str(self.cfg['k']))
+        self.store.set_result(self.cur_rec, d, new_ms); self.update_learn()
         self.status(f'{"加长" if d > 0 else "缩短"} {self.cfg["step"] * 100:.1f}%：刚才那条线下次按 {round(new_ms)} ms'
                     f'（k = {self.cfg["k"]}）', 'ok')
         self.show_info(); self.recalc()
 
     def ok(self):
+        if self.last:
+            self.store.set_result(self.cur_rec, 0, self.last['ms']); self.update_learn()
         self.cfg['step'] = max(0.005, self.cfg['step'] / 2); self.last_dir = 0
         jb.save_config(self.cfg); self.show_info()
         self.status(f'👍 调整幅度收窄为 ±{self.cfg["step"] * 100:.1f}%', 'ok')
+
+
+    # ------------------------------------------------------------ 学习 / AI
+    def predict_async(self):
+        if not self.img or not self.tpls:
+            self.update_learn(); return
+        img, tpls = self.img, self.tpls
+        self.bg(lambda: learn.predict(img, tpls, self.cfg, self.store), lambda p, err: self.after_pred(img, p, err))
+
+    def after_pred(self, img, p, err):
+        if img is not self.img:
+            return                                   # 画面已经换了
+        self.pred = {'err': str(err)} if err else p
+        self.draw(); self.update_learn()
+        if self.v_play.get():
+            self.root.after(150, self.auto_step)
+
+    def update_learn(self):
+        recs = self.store.recs
+        mine = sum(1 for r in recs if not r.get('auto'))
+        lines = [f'已记录 {len(recs)} 跳（你画的 {mine}）· 小人模板 {len(self.tpls) // 2} 个']
+        ang = learn.learned_angle(self.store)
+        if ang:
+            lines.append(f'学到的跳跃角度：{ang:.1f}°')
+        sh = learn.shadow_stats(self.store)
+        if sh['n']:
+            lines.append(f'AI vs 你（最近 {sh["n"]} 跳）：中位误差 {sh["med"] * 100:.1f}%'
+                         + ('  ✓ 够准了，可以试 AI 自动玩' if sh['ok'] else
+                            f'（要 {learn.MIN_SHADOW} 跳、≤{learn.GOOD_ERR * 100:.0f}% 才算够准）'))
+        p = self.pred
+        if p:
+            lines.append(f'这张：AI 预测 {p["ms"]} ms（小人信心 {p["score"]:.2f}）' if 'ms' in p else f'这张：{p["err"]}')
+        elif not self.tpls:
+            lines.append('先自己画线玩几跳，AI 就会开始学小人的样子')
+        f = learn.fit_kb(self.store)
+        self.fit = f if 'k' in f else None
+        if self.fit:
+            lines.append(f'拟合 k = {f["k"]:.4f}，b = {f["b"]:.0f} ms（{f["n"]} 笔，误差 ±{f["rms"]:.0f} ms）')
+        elif f.get('bad'):
+            lines.append(f'有结果的 {f["n"]} 笔，但远近太接近，多跳几种距离才能拟合 k/b')
+        else:
+            lines.append(f'有结果的 {f["n"]} 笔（按 1/2/3），满 8 笔就能拟合 k/b')
+        self.learn_lbl.config(text='\n'.join(lines))
+        self.fit_btn.config(state='normal' if self.fit else 'disabled')
+
+    def apply_fit(self):
+        if not self.fit:
+            return
+        self.cfg['k'] = round(self.fit['k'], 4); self.cfg['b'] = round(self.fit['b'])
+        jb.save_config(self.cfg)
+        for e, key in ((self.e_k, 'k'), (self.e_b, 'b')):
+            e.delete(0, 'end'); e.insert(0, str(self.cfg[key]))
+        self.recalc(); self.predict_async()
+        self.status(f'已套用拟合：k = {self.cfg["k"]}，b = {self.cfg["b"]} ms', 'ok')
+
+    def clear_learn(self):
+        if not messagebox.askyesno('清除学习', '清除所有学习纪录和截图？（k、b 不会变）'):
+            return
+        self.store.clear(); self.tpls = []; self.pred = None
+        self.draw(); self.update_learn(); self.status('学习纪录已清除', 'ok')
+
+    def toggle_play(self):
+        if not self.v_play.get():
+            self.status('⏸ AI 自动玩已停止', 'warn'); return
+        if not self.esp:
+            self.v_play.set(False); self.status('先连接蓝牙', 'warn'); return
+        if not self.tpls:
+            self.v_play.set(False); self.status('AI 还没学过：先自己画线玩几跳', 'warn'); return
+        sh = learn.shadow_stats(self.store)
+        if not sh.get('ok') and not messagebox.askyesno(
+                'AI 还不够准',
+                f'AI 跟你的比较：{sh["n"]} 跳，中位误差 {sh.get("med", 0) * 100:.1f}%。\n'
+                f'（建议 ≥{learn.MIN_SHADOW} 跳、≤{learn.GOOD_ERR * 100:.0f}%）\n\n还是要让它自己玩吗？'):
+            self.v_play.set(False); return
+        self.status('🤖 AI 自动玩中（Esc 停止）', 'ok')
+        self.auto_step()
+
+    def auto_step(self):
+        if not self.v_play.get() or self.busy or self.drag:
+            return
+        p = self.pred
+        if p is None:
+            return                                   # 还在预测，等 after_pred 再叫
+        if 'ms' not in p:
+            self.v_play.set(False)
+            self.status(f'⏸ AI 停下来了：{p.get("err", "看不懂这个画面")}。请手动画这一跳', 'warn')
+            return
+        W = self.img.size[0]
+        a = (p['foot'][0] * W, p['foot'][1] * W)
+        b = (p['center'][0] * W, p['center'][1] * W)
+        if self.press(p['ms']):
+            self.last = {'ms': p['ms'], 'units': p['units']}
+            self.cur_rec = self.store.add(self.img, a, b, p['units'], p['ms'], pred=p, auto=True)
+            self.update_learn()
 
 
 def main():
