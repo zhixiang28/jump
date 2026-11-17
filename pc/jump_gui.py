@@ -68,6 +68,8 @@ class App:
         self.auto_fail = 0
         self.pending = None        # 刚按完、等着量落点的那一跳 (jump, rec)
         self.score = None          # 画面上读到的分数
+        self.shot_fail = 0         # 连续截图失败次数
+        self.awake_old = None      # 手机原本的「接着电源不休眠」设定（结束时还原）
         self.cfg.setdefault('auto_calib', True)
         self.cfg.setdefault('miss_pct', 10)        # AI 自动玩时，故意不跳正中的机率（%）
         self.cfg.setdefault('miss_amount', 0.6)    # 故意偏离最多到「中心→边缘」距离的几成
@@ -394,6 +396,7 @@ class App:
         def check():
             err = jb.check_device(self.adb)
             if not err:
+                self.awake_old = jb.keep_awake(self.adb)   # 接着 USB 时手机不休眠（暗掉时截图常卡住）
                 jb.pick_screencap_mode(self.adb)       # 测一下哪种截图方式比较快
             return err
         self.bg(check, self.after_check)
@@ -431,7 +434,18 @@ class App:
     def after_shot(self, im, err):
         self.grabbing = False
         if err:
-            self.status(f'截图失败：{err}', 'err'); return
+            self.shot_fail += 1
+            self.status(f'截图失败：{err}', 'err')
+            self.store.event('screenshot_fail', err=str(err)[:200], n=self.shot_fail)
+            if self.v_play.get():                    # AI 自动玩：等一下再试，连续失败才停
+                if self.shot_fail <= 3:
+                    self.status(f'截图失败，{2 * self.shot_fail} 秒后再试（第 {self.shot_fail} 次）：{err}', 'warn')
+                    self.root.after(2000 * self.shot_fail, lambda: self.refresh(stable=True))
+                else:
+                    self.v_play.set(False)
+                    self.status(f'⏸ 截图一直失败，AI 停下来了：{err}', 'err')
+            return
+        self.shot_fail = 0
         self.img = im
         self.render()
         self.pred = None
@@ -970,7 +984,13 @@ def main():
     except Exception:  # noqa: BLE001
         pass
     root = tk.Tk()
-    App(root)
+    app = App(root)
+
+    def on_close():                                  # 关视窗时把手机的休眠设定还原
+        if app.adb and app.awake_old is not None:
+            jb.restore_awake(app.adb, app.awake_old)
+        root.destroy()
+    root.protocol('WM_DELETE_WINDOW', on_close)
     root.mainloop()
 
 
