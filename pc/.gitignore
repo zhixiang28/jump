@@ -1,5 +1,6 @@
 jump_config.json
 debug/
 data/
+export/
 __pycache__/
 platform-tools/
