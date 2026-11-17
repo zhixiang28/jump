@@ -62,6 +62,7 @@ class App:
         self.grabbing = False
         self.store = learn.Store()
         self.tpls = learn.build_templates(self.store)
+        self.mem = learn.build_target_memory(self.store)   # 目标记忆：AI 不会、你画给它看的方块
         self.pred = None           # AI 对目前画面的预测
         self.cur_rec = None        # 上一次按压的学习纪录（等你按 1/2/3）
         self.auto_fail = 0
@@ -525,7 +526,8 @@ class App:
             c.create_line(*F, *C, fill='#e9a0ff', width=3, dash=(6, 4), tags='ov')
             for (x, y) in (F, C):
                 c.create_oval(x - 6, y - 6, x + 6, y + 6, outline='#e9a0ff', width=3, tags='ov')
-            c.create_text(C[0], C[1] - 18, text=f'AI {p["ms"]} ms', fill='#e9a0ff',
+            c.create_text(C[0], C[1] - 18, text=f'AI{"（记忆）" if p.get("method") == "memory" else ""} {p["ms"]} ms',
+                          fill='#e9a0ff',
                           font=('Microsoft YaHei UI', 11, 'bold'), tags='ov')
         if not self.line:
             return
@@ -574,6 +576,10 @@ class App:
                                           extra=self.press_extra())
             self.pending = (self.make_jump(self.line['a'], self.line['b'], self.units), self.cur_rec)
             self.tpls = learn.build_templates(self.store)     # 学新的小人样子
+            n_mem = len(self.mem)
+            self.mem = learn.build_target_memory(self.store)  # AI 不会的方块记下来
+            if len(self.mem) > n_mem:
+                self.store.event('memory_add', n=len(self.mem))
             self.update_learn()
 
     def press_extra(self):
@@ -649,13 +655,13 @@ class App:
     def predict_async(self):
         if not self.img or not self.tpls:
             self.update_learn(); return
-        img, tpls = self.img, self.tpls
+        img, tpls, mem = self.img, self.tpls, self.mem
         pend, self.pending = self.pending, None
 
         def work():
             ch = learn.find_char(img, tpls)            # 小人只找一次，量落点和预测共用
             land = learn.landing(img, tpls, pend[0], ch=ch) if pend else None
-            return learn.predict(img, tpls, self.cfg, self.store, ch=ch), land, learn.read_score(img)
+            return learn.predict(img, tpls, self.cfg, self.store, ch=ch, mem=mem), land, learn.read_score(img)
         self.bg(work, lambda res, err: self.after_pred(img, res, err, pend))
 
     def after_pred(self, img, res, err, pend=None):
@@ -740,7 +746,7 @@ class App:
     def update_learn(self):
         recs = self.store.recs
         mine = sum(1 for r in recs if not r.get('auto'))
-        lines = [f'已记录 {len(recs)} 跳（你画的 {mine}）· 小人模板 {len(self.tpls) // 2} 个']
+        lines = [f'已记录 {len(recs)} 跳（你画的 {mine}）· 小人模板 {len(self.tpls) // 2} 个 · 目标记忆 {len(self.mem)} 种']
         tgt = int(self.cfg.get('target_score') or 0)
         if self.score is not None or tgt:
             lines.append(f'目前分数：{self.score if self.score is not None else "?"}'
@@ -811,7 +817,7 @@ class App:
     def clear_learn(self):
         if not messagebox.askyesno('清除学习', '清除所有学习纪录和截图？（k、b 不会变）'):
             return
-        self.store.clear(); self.tpls = []; self.pred = None
+        self.store.clear(); self.tpls = []; self.mem = []; self.pred = None
         self.draw(); self.update_learn(); self.status('学习纪录已清除', 'ok')
 
     def toggle_play_btn(self):

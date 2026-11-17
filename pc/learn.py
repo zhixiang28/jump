@@ -584,6 +584,77 @@ def find_target(im, foot, angle_deg=30, diff_thr=45):
     return {'center': (cx / Wn, cy / Wn), 'top': (cx / Wn, ty / Wn), 'side': side, 'width': w / Wn, 'method': 'shape'}
 
 
+# ================================================================ 目标记忆
+# 规则（奶油色顶面）偶尔会认错或认不出某种方块。你手动画线时，如果 AI 当时找不到目标、
+# 或 AI 的终点跟你画的差很多，就把你画的终点附近那块方块记下来（含中心在哪里）。
+# 之后遇到同一种方块，就用记忆比对。
+MEM_W, MEM_H = 0.34, 0.26          # 记忆样板大小（屏宽比例），中心放在样板中间偏下一点
+MEM_DISAGREE = 0.05                # AI 跟你画的终点差超过屏宽的 5% 才算「AI 不会」
+
+
+def build_target_memory(store, max_n=20, scan=150):
+    mem = []
+    tw, th = round(MEM_W * NW), round(MEM_H * NW)
+    for rec in reversed(store.recs):
+        scan -= 1
+        if scan <= 0 or len(mem) >= max_n:
+            break
+        if rec.get('auto'):
+            continue
+        p = rec.get('pred') or {}
+        b = rec['b']
+        if p.get('center') and math.hypot(p['center'][0] - b[0], p['center'][1] - b[1]) <= MEM_DISAGREE:
+            continue                                   # AI 当时就对了，不用记
+        try:
+            img = as_arr(store.shot(rec), NW)
+        except Exception:  # noqa: BLE001
+            continue
+        cx, cy = b[0] * NW, b[1] * NW
+        x0, y0 = round(cx - tw / 2), round(cy - th * 0.55)
+        if x0 < 0 or y0 < 0 or x0 + tw > img.shape[1] or y0 + th > img.shape[0]:
+            continue
+        crop = img[y0:y0 + th, x0:x0 + tw]
+        if any(ncc_at(crop, M['t'], 0, 0) > 0.9 for M in mem):
+            continue                                   # 这种方块已经记过了
+        mem.append({'t': crop, 'half': half(crop), 'cx': cx - x0, 'cy': cy - y0, 'id': rec['id']})
+    return mem
+
+
+def find_target_memory(im, foot, mem, angle_deg=30):
+    """在小人斜上方、靠近跳跃线的地方找记忆里的方块。回传 {'center', 'score', 'side'} 或 None。"""
+    if not mem:
+        return None
+    small = as_arr(im, NW // 2)
+    Wn = small.shape[1]
+    fx, fy = foot[0] * Wn, foot[1] * Wn
+    ya, yb = max(0, int(fy - 0.85 * Wn)), int(fy + 0.05 * Wn)
+    reg = small[ya:yb]
+    t = math.tan(math.radians(angle_deg))
+    best = None
+    for M in mem:
+        m = ncc_map(reg, M['half'])
+        if m is None:
+            continue
+        # 只接受中心落在跳跃线附近、在小人斜上方的位置
+        hh, ww = m.shape
+        ys, xs = np.mgrid[0:hh, 0:ww]
+        ccx = xs + M['cx'] / 2
+        ccy = ys + ya + M['cy'] / 2
+        dx, dy = ccx - fx, fy - ccy
+        ok = (np.abs(dx) >= 0.12 * Wn) & (dy > 0) & (np.abs(dy - np.abs(dx) * t) <= 0.06 * Wn + 0.12 * np.abs(dx) * t)
+        if not ok.any():
+            continue
+        mm = np.where(ok, m, -2)
+        y, x = np.unravel_index(int(np.argmax(mm)), mm.shape)
+        sc = float(mm[y, x])
+        if best is None or sc > best[0]:
+            best = (sc, (ccx[y, x]) / Wn, (ccy[y, x]) / Wn, M['id'])
+    if not best:
+        return None
+    sc, cx, cy, mid = best
+    return {'center': (cx, cy), 'score': sc, 'side': 1 if cx > foot[0] else -1, 'mem_id': mid}
+
+
 # ================================================================ 预测 / 统计
 def shadow_stats(store, n=10):
     """最近 n 笔「你画线、AI 也有预测」的纪录：AI 距离 / 你的距离 的误差。"""
@@ -612,7 +683,7 @@ def learned_angle(store, n=20):
     return float(np.median(angs)) if len(angs) >= 5 else None
 
 
-def predict(im, tpls, cfg, store, char_thr=0.55, ch=None):
+def predict(im, tpls, cfg, store, char_thr=0.55, ch=None, mem=None):
     """回传预测 dict（失败时 'err' 说明原因）。ch：已经找过的小人（省一次）。"""
     ch = ch or find_char(im, tpls)
     if not ch:
@@ -621,6 +692,14 @@ def predict(im, tpls, cfg, store, char_thr=0.55, ch=None):
         return {'err': f'找不到小人（信心 {ch["score"]:.2f}）', 'score': ch['score']}
     ang = learned_angle(store) or cfg.get('jump_angle_deg', 30)
     tg = find_target(im, ch['foot'], ang)
+    if mem:
+        mm = find_target_memory(im, ch['foot'], mem, ang)
+        if mm:
+            far = (not tg) or math.hypot(mm['center'][0] - tg['center'][0], mm['center'][1] - tg['center'][1]) > 0.06
+            # 规则找不到 → 记忆够像就用；规则找到但跟「你纠正过的那种方块」很像却不同位置 → 相信记忆
+            if (not tg and mm['score'] >= 0.75) or (tg and far and mm['score'] >= 0.93):
+                tg = {'center': mm['center'], 'top': mm['center'], 'side': mm['side'],
+                      'width': (tg or {}).get('width', 0.3), 'method': 'memory', 'mem_score': mm['score']}
     if not tg:
         return {'err': '找不到目标方块', 'foot': ch['foot'], 'score': ch['score']}
     fx, fy = ch['foot']
@@ -637,7 +716,7 @@ def predict(im, tpls, cfg, store, char_thr=0.55, ch=None):
     ms = ms_for(units, tg['side'], fy, cfg)
     return {'foot': ch['foot'], 'center': tg['center'], 'top': tg['top'], 'side': tg['side'],
             'score': ch['score'], 'raw_units': raw_units, 'units': units, 'corr': corr, 'ms': ms, 'angle': ang,
-            'width': tg.get('width', 0)}
+            'width': tg.get('width', 0), 'method': tg.get('method', 'face'), 'mem_score': tg.get('mem_score')}
 
 
 MIN_LAND = 6
