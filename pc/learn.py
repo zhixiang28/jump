@@ -958,6 +958,8 @@ def calibration_update(store, cfg, rec):
         traveled = rec['land']['traveled']
         if traveled < 50:
             return None, ''
+        if not fresh and abs(rec['land']['err'] - (rec.get('aim') or 0)) / max(1.0, rec['units']) > TOUCH_GLITCH:
+            return None, ''                               # 偏太多：多半是按压没被完整认到，不拿这一跳来修
         cw = (rec.get('pred') or {}).get('cur_width') or 0
         corr = (cfg.get('k_side', 0) * _jump_side(rec) + cfg.get('k_foot', 0) * (rec['a'][1] - cfg.get('foot0', rec['a'][1]))
                 + cfg.get('k_small', 0) * (1.0 if 0 < cw < SMALL_FACE else 0.0))
@@ -982,6 +984,30 @@ def calibration_update(store, cfg, rec):
     new = {key: (round(v, 4) if key in ('k', 'foot0') else round(v, 1) if key in ('k_side', 'k_foot', 'k_small') else round(v))
            for key, v in new.items()}
     return new, how
+
+
+# ================================================================ 手机没反应的按压
+# 触控笔偶尔没被手机认到（小人根本没跳），或晚一点才认到（跳得特别近）。以前程序把「没跳」的画面
+# 当成落点去量、拿去校准，k、b 会被带歪，还会误触发「装置变了」重新校准。
+NOJUMP_DIFF = 2.5       # 按前、按后两张小灰阶图平均差小于这个 = 画面没变（真的跳过最少也有 5 以上；只有雪花飘约 0.5）
+TOUCH_GLITCH = 0.15     # 偏超过 15%：多半是按压没被完整认到（触控笔接触不良），不拿来做单跳校准、不算「装置变了」
+
+
+def scene_small(im):
+    return np.asarray(im.convert('L').resize((60, 132)), dtype=np.float32)
+
+
+def scene_diff(before_small, im):
+    """按之前的小图 vs 现在的画面，平均差多少（越小越像同一个画面）。"""
+    if before_small is None or im is None:
+        return None
+    return float(np.abs(before_small - scene_small(im)).mean())
+
+
+def touch_stats(store, n=30):
+    """最近 n 次 AI 按压里，手机没反应几次。"""
+    rs = [r for r in store.recs if r.get('auto')][-n:]
+    return sum(1 for r in rs if r.get('no_jump')), len(rs)
 
 
 # ================================================================ 用游戏的 Perfect 判定修正瞄准
@@ -1032,11 +1058,14 @@ def bias_alarm(store, cfg, n=5, thr=0.05):
     触发后要再累积 10 跳以上才会再触发（不然会一直清掉资料、永远学不起来）。"""
     if len(_land_recs(store, cfg, 999)) < 10:
         return False
-    rs = _land_recs(store, cfg, n)
+    def pct(r):
+        return (r['land']['err'] - (r.get('aim') or 0)) / max(1.0, r['land']['traveled'] - r['land']['err'])
+    # 偏超过 15% 的多半是触控笔没按好（不是装置变了），不算进来
+    rs = [r for r in _land_recs(store, cfg, 999) if abs(pct(r)) <= TOUCH_GLITCH][-n:]
     if len(rs) < n:
         return False
-    pct = [(r['land']['err'] - (r.get('aim') or 0)) / max(1.0, r['land']['traveled'] - r['land']['err']) for r in rs]
-    return all(p > thr for p in pct) or all(p < -thr for p in pct)
+    ps = [pct(r) for r in rs]
+    return all(p > thr for p in ps) or all(p < -thr for p in ps)
 
 
 def land_stats(store, n=10):
@@ -1080,7 +1109,7 @@ def export(store, cfg, extra_info=None):
     # 每一跳一行，Excel 可以直接打开（utf-8-sig 让 Excel 认得中文）
     rows = [['#', 'id', '时间', '谁', '距离', '按压ms', '当时k', '当时b', 'AI预测距离', 'AI小人信心',
              '落点偏差', '落点偏差%', '实际跳的距离', '结果(-1跳太远 0刚好 1跳太近)', '按下时间', 'ESP回报按完时间',
-             '故意偏离', '按之前的分数', '故意结束']]
+             '故意偏离', '按之前的分数', '故意结束', '手机没反应']]
     for i, r in enumerate(recs, 1):
         land = r.get('land') or {}
         units = (land.get('traveled', 0) - land.get('err', 0)) if land else 0
@@ -1090,7 +1119,7 @@ def export(store, cfg, extra_info=None):
                      r.get('k_used', ''), r.get('b_used', ''), pred.get('units', ''), pred.get('score', ''),
                      land.get('err', ''), pct, land.get('traveled', ''), '' if r.get('r') is None else r['r'],
                      r.get('t_press', ''), r.get('t_done', ''), r.get('aim', ''), r.get('score', ''),
-                     'Y' if r.get('end_game') else ''])
+                     'Y' if r.get('end_game') else '', 'Y' if r.get('no_jump') else ''])
     lc = land_count(store)
     sh = shadow_stats(store)
     ls = land_stats(store)
@@ -1101,6 +1130,7 @@ def export(store, cfg, extra_info=None):
         f'量到落点：{lc} 跳' + (f'，最近 {ls["n"]} 跳平均偏 {ls["mean"] * 100:.2f}%' if ls else ''),
         f'AI vs 你：' + (f'最近 {sh["n"]} 跳中位误差 {sh["med"] * 100:.2f}%' if sh.get('n') else '没有资料'),
         f'瞄准左右修正（x_shift）：{cfg.get("x_shift", 0)}',
+        f'手机没反应的按压：{sum(1 for r in recs if r.get("no_jump"))} 次（共 {len(recs)} 跳）',
         f'目前 k = {cfg.get("k")}, b = {cfg.get("b")}, 跳跃角度 {cfg.get("jump_angle_deg")}°, 投影 {cfg.get("gui_proj")}',
         '落点拟合：' + (f'k = {fl["k"]:.4f}, b = {fl["b"]:.1f}, 左右修正 {fl["k_side"]:+.1f} ms, 高度修正 {fl["k_foot"]:+.1f}'
                        f'（{fl["terms"]}，{fl["n"]} 跳，±{fl["rms"]:.1f} ms，另一半资料测 ±{fl["cv"]:.1f} ms）' if fl else '资料不够'),

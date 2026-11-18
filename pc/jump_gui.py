@@ -76,6 +76,7 @@ class App:
         self.cur_rec = None        # 上一次按压的学习纪录（等你按 1/2/3）
         self.auto_fail = 0
         self.pending = None        # 刚按完、等着量落点的那一跳 (jump, rec)
+        self.ignored = 0           # 连续几次按压手机没反应（小人没跳）
         self.score = None          # 画面上读到的分数
         self.shot_fail = 0         # 连续截图失败次数
         self.awake_old = None      # 手机原本的「接着电源不休眠」设定（结束时还原）
@@ -849,7 +850,8 @@ class App:
         dx, dy = b[0] - a[0], b[1] - a[1]
         n = math.hypot(dx, dy) or 1.0
         width = (p or {}).get('width') if p and 'center' in p else None
-        return {'dir': (dx / n, dy / n), 'units': units, 'width': width}
+        return {'dir': (dx / n, dy / n), 'units': units, 'width': width,
+                'before': learn.scene_small(self.img)}             # 按之前的画面：用来判断「手机有没有反应」
 
     def press(self, ms):
         if self.busy:
@@ -893,15 +895,16 @@ class App:
         def work():
             ch = learn.find_char(img, tpls)            # 小人只找一次，量落点和预测共用
             land = learn.landing(img, tpls, pend[0], ch=ch) if pend else None
-            return learn.predict(img, tpls, self.cfg, self.store, ch=ch, mem=mem), land, learn.read_score(img)
+            moved = learn.scene_diff(pend[0].get('before'), img) if pend else None
+            return learn.predict(img, tpls, self.cfg, self.store, ch=ch, mem=mem), land, learn.read_score(img), moved
         self.bg(work, lambda res, err: self.after_pred(img, res, err, pend))
 
     def after_pred(self, img, res, err, pend=None):
-        p, land, score = res if res else ({'err': str(err)}, None, None)
+        p, land, score, moved = res if res else ({'err': str(err)}, None, None, None)
         if score is not None and img is self.img:
             self.score = score                       # 读不到（例如通知挡住）就沿用上一次的
         if pend:
-            self.handle_landing(land, pend, img, score)
+            self.handle_landing(land, pend, img, score, moved)
         if img is not self.img:
             return                                   # 画面已经换了
         if 'units' in p:                             # k/b 可能刚被校准过：用最新的重算 ms
@@ -911,9 +914,13 @@ class App:
         if self.v_play.get():
             self.root.after(150, self.auto_step)
 
-    def handle_landing(self, land, pend, img=None, score_after=None):
+    def handle_landing(self, land, pend, img=None, score_after=None, moved=None):
         jump, rec = pend
         self.store.save_after(rec, img)                 # 跳完的画面也存起来（导出用）
+        if moved is not None and moved < learn.NOJUMP_DIFF and not rec.get('end_game') \
+                and (score_after is None or score_after == rec.get('score')):
+            self.press_ignored(rec, moved); return
+        self.ignored = 0
         # 游戏自己的判定：分数一次加 5 分以上 = Perfect（落在中心附近）。比任何影像量测都可靠。
         before = rec.get('score')
         gain = (score_after - before) if (score_after is not None and before is not None) else None
@@ -967,6 +974,21 @@ class App:
             msg += f'（没拿到 Perfect、落点偏{"左" if xs > x_old else "右"} → 瞄准修正 {xs:+.0f}）'
 
         self.status('落点：' + msg, 'ok' if abs(pct) < 3 else 'warn')
+
+    def press_ignored(self, rec, moved):
+        """按了但画面完全没变（小人没跳）：触控笔没被手机认到。这跳不量、不校准；AI 会再按一次。"""
+        rec['no_jump'] = True
+        self.store.save()
+        self.ignored += 1
+        bad, n = learn.touch_stats(self.store)
+        self.store.event('press_ignored', id=rec['id'], ms=rec['ms'], diff=round(moved, 2), streak=self.ignored, recent=bad)
+        hint = '检查触控笔有没有碰到屏幕，可以把「压下」角度加 1～2 度'
+        if self.ignored >= 3 and self.v_play.get():
+            self.v_play.set(False)
+            self.status(f'⏸ 连续 {self.ignored} 次按压手机都没反应（小人没跳），AI 停下来了。{hint}', 'err')
+        else:
+            self.status(f'⚠ 这次按压手机没反应（小人没跳），再按一次'
+                        + (f'（最近 {n} 跳里已经 {bad} 次：{hint}）' if bad >= 3 else ''), 'warn')
 
     def calibrate(self, rec, jump):
         if learn.bias_alarm(self.store, self.cfg):
