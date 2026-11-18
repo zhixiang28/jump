@@ -119,6 +119,11 @@ def find_adb(cfg):
 def check_device(adb):
     out = subprocess.run([adb, 'devices'], capture_output=True, text=True, timeout=15).stdout
     lines = [l for l in out.splitlines()[1:] if l.strip()]
+    want = os.environ.get('ANDROID_SERIAL')                  # 有两支手机时：只看选的那一支
+    if want:
+        lines = [l for l in lines if l.split()[0] == want]
+        if not lines:
+            return f'选的那支手机（{want}）没有接上：检查 USB 线（另一支手机有接着不算）'
     if not lines:
         return '没有找到手机：检查 USB 线，以及手机上是否开了「USB 调试」'
     if any('unauthorized' in l for l in lines):
@@ -358,7 +363,12 @@ class Esp:
                 return True
             return SVC in [u.lower() for u in (ad.service_uuids or [])]
 
-        dev = await BleakScanner.find_device_by_filter(match, timeout=15)
+        dev = None
+        addr = (self.cfg.get('ble_addr') or '').strip()
+        if addr:                                   # 这支手机上次用的那块板子（有两块板子时不会连错）
+            dev = await BleakScanner.find_device_by_address(addr, timeout=6)
+        if not dev:
+            dev = await BleakScanner.find_device_by_filter(match, timeout=15)
         if not dev:
             raise RuntimeError('找不到 ESP32：确认它有通电，而且没有被别的装置连着')
         def lost(_):
@@ -383,6 +393,7 @@ class Esp:
                     pass
 
         await self.client.start_notify(TX, on_notify)
+        self.address = dev.address
         print(f'已连接 {dev.name or dev.address}')
 
     async def press(self, ms):

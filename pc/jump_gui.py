@@ -13,6 +13,7 @@
      并在你玩的时候偷偷预测（紫色虚线），跟你画的比较；够准了再打开「AI 自动玩」。
 """
 import asyncio
+import json
 import math
 import os
 import subprocess
@@ -29,6 +30,7 @@ from PIL import Image, ImageTk
 
 import jump_bot as jb
 import learn
+import profiles
 import stream
 
 FONT = ('Microsoft YaHei UI', 11)
@@ -40,6 +42,8 @@ CARD = '#1d2026'
 class App:
     def __init__(self, root):
         self.root = root
+        self.phone = getattr(root, 'phone_name', '')   # 这支手机的设定（profiles.py）
+        self.phone_note = getattr(root, 'phone_note', '')
         self.cfg = jb.load_config()
         for k, v in {'gui_auto': False, 'gui_proj': True, 'gui_live': False}.items():
             self.cfg.setdefault(k, v)
@@ -76,6 +80,7 @@ class App:
         self.cur_rec = None        # 上一次按压的学习纪录（等你按 1/2/3）
         self.auto_fail = 0
         self.pending = None        # 刚按完、等着量落点的那一跳 (jump, rec)
+        self.ignored = 0           # 连续几次按压手机没反应（小人没跳）
         self.score = None          # 画面上读到的分数
         self.shot_fail = 0         # 连续截图失败次数
         self.awake_old = None      # 手机原本的「接着电源不休眠」设定（结束时还原）
@@ -108,7 +113,7 @@ class App:
     # ------------------------------------------------------------ 介面
     def build(self):
         r = self.root
-        r.title('Servo Press · 手机画面画线')
+        r.title('Servo Press · ' + (self.phone or '手机画面画线'))
         r.configure(bg=BG)
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
         self.wide = sw >= 1150                     # 够宽就三栏；太窄就两栏（右边捲动）
@@ -457,7 +462,8 @@ class App:
             self.status(str(err or err_msg), 'err'); return
         self.refresh()
         src = getattr(self, 'source_info', '') or f'截图（{jb.SCREENCAP_INFO}）'
-        self.status(self.reset_msg or f'画面来源：{src}', 'warn' if self.reset_msg else 'ok')
+        phone = f'手机：{self.phone}' + (f'（{self.phone_note}）' if self.phone_note else '') + '\n' if self.phone else ''
+        self.status(phone + (self.reset_msg or f'画面来源：{src}'), 'warn' if (self.reset_msg or self.phone_note) else 'ok')
 
     def start_stream(self):
         """开影像串流（背景执行绪里呼叫）。失败就用原本的截图方式。"""
@@ -725,7 +731,13 @@ class App:
         self.bt.config(text='🔗 已连接', bg='#1fa955', state='normal')
         esp.on_angles = lambda r, p: self.q.put(lambda: self.got_angles(r, p))   # 蓝牙执行绪 → 介面
         esp.on_lost = lambda: self.q.put(lambda: self.ble_lost(esp, '蓝牙断开'))
-        self.bg_async(esp.send('G'), lambda _, err: None)                      # 读板子上的角度
+        addr = getattr(esp, 'address', '')
+        if addr and addr != self.cfg.get('ble_addr'):
+            self.cfg['ble_addr'] = addr                  # 记住这支手机用哪块板子
+            jb.save_config(self.cfg)
+        # 每支手机的 servo 角度不一样：先把这支手机的角度写到板子，再读回来确认
+        r_, p_ = int(self.cfg.get('servo_rest', 0)), int(self.cfg.get('servo_push', 90))
+        self.bg_async(esp.send(f'A{r_},{p_}'), lambda _, err: self.bg_async(esp.send('G'), lambda *a: None))
         if self.ble_retry:
             self.store.event('ble_reconnect', ok=True, tries=self.ble_retry)
         resume, self.ble_retry, self.ble_resume = self.ble_resume, 0, False
@@ -849,7 +861,8 @@ class App:
         dx, dy = b[0] - a[0], b[1] - a[1]
         n = math.hypot(dx, dy) or 1.0
         width = (p or {}).get('width') if p and 'center' in p else None
-        return {'dir': (dx / n, dy / n), 'units': units, 'width': width}
+        return {'dir': (dx / n, dy / n), 'units': units, 'width': width,
+                'before': learn.scene_small(self.img)}             # 按之前的画面：用来判断「手机有没有反应」
 
     def press(self, ms):
         if self.busy:
@@ -893,15 +906,16 @@ class App:
         def work():
             ch = learn.find_char(img, tpls)            # 小人只找一次，量落点和预测共用
             land = learn.landing(img, tpls, pend[0], ch=ch) if pend else None
-            return learn.predict(img, tpls, self.cfg, self.store, ch=ch, mem=mem), land, learn.read_score(img)
+            moved = learn.scene_diff(pend[0].get('before'), img) if pend else None
+            return learn.predict(img, tpls, self.cfg, self.store, ch=ch, mem=mem), land, learn.read_score(img), moved
         self.bg(work, lambda res, err: self.after_pred(img, res, err, pend))
 
     def after_pred(self, img, res, err, pend=None):
-        p, land, score = res if res else ({'err': str(err)}, None, None)
+        p, land, score, moved = res if res else ({'err': str(err)}, None, None, None)
         if score is not None and img is self.img:
             self.score = score                       # 读不到（例如通知挡住）就沿用上一次的
         if pend:
-            self.handle_landing(land, pend, img, score)
+            self.handle_landing(land, pend, img, score, moved)
         if img is not self.img:
             return                                   # 画面已经换了
         if 'units' in p:                             # k/b 可能刚被校准过：用最新的重算 ms
@@ -911,9 +925,13 @@ class App:
         if self.v_play.get():
             self.root.after(150, self.auto_step)
 
-    def handle_landing(self, land, pend, img=None, score_after=None):
+    def handle_landing(self, land, pend, img=None, score_after=None, moved=None):
         jump, rec = pend
         self.store.save_after(rec, img)                 # 跳完的画面也存起来（导出用）
+        if moved is not None and moved < learn.NOJUMP_DIFF and not rec.get('end_game') \
+                and (score_after is None or score_after == rec.get('score')):
+            self.press_ignored(rec, moved); return
+        self.ignored = 0
         # 游戏自己的判定：分数一次加 5 分以上 = Perfect（落在中心附近）。比任何影像量测都可靠。
         before = rec.get('score')
         gain = (score_after - before) if (score_after is not None and before is not None) else None
@@ -967,6 +985,21 @@ class App:
             msg += f'（没拿到 Perfect、落点偏{"左" if xs > x_old else "右"} → 瞄准修正 {xs:+.0f}）'
 
         self.status('落点：' + msg, 'ok' if abs(pct) < 3 else 'warn')
+
+    def press_ignored(self, rec, moved):
+        """按了但画面完全没变（小人没跳）：触控笔没被手机认到。这跳不量、不校准；AI 会再按一次。"""
+        rec['no_jump'] = True
+        self.store.save()
+        self.ignored += 1
+        bad, n = learn.touch_stats(self.store)
+        self.store.event('press_ignored', id=rec['id'], ms=rec['ms'], diff=round(moved, 2), streak=self.ignored, recent=bad)
+        hint = '检查触控笔有没有碰到屏幕，可以把「压下」角度加 1～2 度'
+        if self.ignored >= 3 and self.v_play.get():
+            self.v_play.set(False)
+            self.status(f'⏸ 连续 {self.ignored} 次按压手机都没反应（小人没跳），AI 停下来了。{hint}', 'err')
+        else:
+            self.status(f'⚠ 这次按压手机没反应（小人没跳），再按一次'
+                        + (f'（最近 {n} 跳里已经 {bad} 次：{hint}）' if bad >= 3 else ''), 'warn')
 
     def calibrate(self, rec, jump):
         if learn.bias_alarm(self.store, self.cfg):
@@ -1036,7 +1069,7 @@ class App:
         if not self.store.recs:
             self.status('还没有资料可以导出（先玩几跳）', 'warn'); return
         self.export_btn.config(state='disabled', text='导出中…')
-        info = {'截图方式': jb.SCREENCAP_INFO, '画面来源': getattr(self, 'source_info', ''), '串流开启次数': self.stream_starts}
+        info = {'手机': self.phone, '截图方式': jb.SCREENCAP_INFO, '画面来源': getattr(self, 'source_info', ''), '串流开启次数': self.stream_starts}
         if self.img:
             info['手机截图大小'] = f'{self.img.size[0]}x{self.img.size[1]}'
         self.bg(lambda: learn.export(self.store, dict(self.cfg), info), self.after_export)
@@ -1157,6 +1190,45 @@ class App:
         return random.uniform(lo, hi) * random.choice((-1, 1))
 
 
+def choose_phone(root):
+    """认手机、切到那支手机的设定。两支都插着就让你选。"""
+    try:
+        with open(profiles.LEGACY_CONFIG, encoding='utf-8') as f:
+            adb_cfg = json.load(f)
+    except Exception:  # noqa: BLE001
+        adb_cfg = {}
+    adb = jb.find_adb(adb_cfg)
+    devs = [d for d in profiles.list_devices(adb) if d['state'] == 'device'] if adb else []
+    pick = None
+    if len(devs) == 1:
+        pick = devs[0]
+    elif len(devs) > 1:
+        root.withdraw()
+        win = tk.Toplevel(root)
+        win.title('选择手机')
+        win.configure(bg=BG, padx=24, pady=18)
+        tk.Label(win, text='接着两支以上的手机，这次要用哪一支？', font=FONT_B, bg=BG, fg=TEXT).pack(pady=(0, 12))
+        idx = profiles.load_index()
+        res = {}
+        for d in devs:
+            label = profiles.display_name(d['serial'], d['model']) + ('' if d['serial'] in idx else '（第一次用）')
+            tk.Button(win, text=label, font=FONT_B, bg='#3b7cff', fg='#fff', relief='flat', padx=14, pady=8,
+                      command=lambda d=d: (res.update(d=d), win.destroy())).pack(fill='x', pady=4)
+        win.protocol('WM_DELETE_WINDOW', win.destroy)
+        root.wait_window(win)
+        pick = res.get('d') or devs[0]
+        root.deiconify()
+    if pick is None:                                 # 没接手机：先用上次那支的设定（接上后重开程式）
+        serial, model = profiles.last_used()
+        if serial is None:
+            return
+        pick = {'serial': serial, 'model': model}
+    d, name, note = profiles.activate(pick['serial'], pick['model'])
+    jb.CONFIG_PATH = os.path.join(d, 'jump_config.json')
+    learn.set_data_dir(os.path.join(d, 'data'))
+    root.phone_name, root.phone_note = name, note
+
+
 def main():
     try:   # Windows 高解析度萤幕：避免视窗模糊、座标偏移
         import ctypes
@@ -1164,6 +1236,7 @@ def main():
     except Exception:  # noqa: BLE001
         pass
     root = tk.Tk()
+    choose_phone(root)
     app = App(root)
 
     def on_close():                                  # 关视窗时把手机的休眠设定还原、关掉串流、断开蓝牙
