@@ -40,6 +40,15 @@ GOOD_ERR = 0.03     # 中位误差 ≤ 3% 算够准
 
 
 # ================================================================ 纪录
+def _json_default(o):
+    """numpy 的数字 / 布林值（例如 np.bool_）json 不认得：换成一般的 Python 值。"""
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    return str(o)
+
+
 class Store:
     def __init__(self):
         os.makedirs(SHOTS, exist_ok=True)
@@ -55,7 +64,7 @@ class Store:
     def save(self):
         tmp = LOG + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(self.recs, f, ensure_ascii=False)
+            json.dump(self.recs, f, ensure_ascii=False, default=_json_default)
         os.replace(tmp, LOG)
 
     def add(self, im, a, b, units, ms, pred=None, auto=False, extra=None):
@@ -109,9 +118,9 @@ class Store:
                     w.writerow(['time', 'clock', 'event', 'detail'])
                 t = time.time()
                 w.writerow([f'{t:.3f}', time.strftime('%H:%M:%S', time.localtime(t)) + f'.{int(t * 1000) % 1000:03d}',
-                            kind, json.dumps(kv, ensure_ascii=False)])
-        except Exception:  # noqa: BLE001
-            pass
+                            kind, json.dumps(kv, ensure_ascii=False, default=_json_default)])
+        except Exception as e:  # noqa: BLE001
+            print('操作纪录写不了：', kind, e)
 
     def set_result(self, rec, r, est):
         if rec is None:
@@ -1047,8 +1056,8 @@ def export(store, cfg, extra_info=None):
 
     with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
         z.writestr('summary.txt', '\n'.join(summary))
-        z.writestr('jump_config.json', json.dumps(cfg, ensure_ascii=False, indent=2))
-        z.writestr('log.json', json.dumps(recs, ensure_ascii=False, indent=1))
+        z.writestr('jump_config.json', json.dumps(cfg, ensure_ascii=False, indent=2, default=_json_default))
+        z.writestr('log.json', json.dumps(recs, ensure_ascii=False, indent=1, default=_json_default))
         buf = __import__('io').StringIO()
         csv.writer(buf).writerows(rows)
         z.writestr('jumps.csv', '\ufeff' + buf.getvalue())
