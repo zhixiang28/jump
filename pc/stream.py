@@ -63,13 +63,8 @@ def ensure_server():
 
 
 class ScrcpyStream:
-    def __init__(self, adb, max_size=1920, bit_rate=12_000_000, max_fps=30, port=None, connect=None):
+    def __init__(self, adb, max_size=1920, bit_rate=12_000_000, max_fps=30, port=27183, connect=None):
         self.adb = adb
-        if port is None:                      # 找一个没人用的 port（两支手机同时开两个程式也不会撞）
-            s = socket.socket()
-            s.bind(('127.0.0.1', 0))
-            port = s.getsockname()[1]
-            s.close()
         self.max_size = max_size
         self.bit_rate = bit_rate
         self.max_fps = max_fps
