@@ -86,6 +86,8 @@ class App:
         self.cfg.setdefault('target_score', 0)     # 目标分数：AI 自动玩到这个分数就故意失误结束（0 = 不限）
         self.reset_msg = ''
         self.cfg['k_foot'] = 0                     # 「小人高度修正」已经拿掉（不稳定）
+        if 'x_shift' not in self.cfg:              # 瞄准左右修正：第一次用从以前 Perfect 的那几跳估起始值
+            self.cfg['x_shift'] = learn.x_shift_initial(self.store)
         if not learn.sane_calibration(self.cfg):   # 例如之前学坏的 k = 0.30、b = 524，或 k = 1.70、b = −50
             old = (self.cfg.get('k'), self.cfg.get('b'))
             f = learn.fit_land(self.store, cfg=dict(self.cfg, calib_since=0))   # 先试着用以前量到的落点重算
@@ -388,6 +390,8 @@ class App:
             extra.append(f'右上 {self.cfg["k_side"]:+.0f} ms')
         if self.cfg.get('k_small'):
             extra.append(f'从小平台起跳 {self.cfg["k_small"]:+.0f} ms')
+        if self.cfg.get('x_shift'):
+            extra.append(f'瞄准往{"右" if self.cfg["x_shift"] > 0 else "左"}挪 {abs(self.cfg["x_shift"]):.0f}')
         if self.cfg.get('k_foot'):
             extra.append(f'高度修正 {self.cfg["k_foot"]:+.0f}')
         self.info_lbl.config(text=f'目前：k = {self.cfg["k"]}，b = {self.cfg["b"]} ms'
@@ -830,7 +834,8 @@ class App:
 
     def press_extra(self):
         """每一跳额外记下来的东西（导出后用来重新校准）。"""
-        return {'k_used': self.cfg['k'], 'b_used': self.cfg['b'], 't_press': round(time.time(), 3),
+        return {'k_used': self.cfg['k'], 'b_used': self.cfg['b'], 'x_shift_used': self.cfg.get('x_shift', 0),
+                't_press': round(time.time(), 3),
                 'proj': bool(self.cfg.get('gui_proj')), 'angle': self.cfg.get('jump_angle_deg'), 'score': self.score}
 
     def make_jump(self, a, b, units):
@@ -928,10 +933,12 @@ class App:
         if land.get('lost'):
             if rec.get('end_game'):
                 self.status(f'🏁 目标分数达成，这一局已结束（最后分数 {rec.get("score")}）', 'ok')
+                if self.v_play.get():
+                    self.v_play.set(False)
             else:
-                self.status('⚠ 跳完找不到小人：可能掉下去了（游戏结束？）', 'err')
-            if self.v_play.get():
-                self.v_play.set(False)
+                # 不要马上停：有时只是动画 / 奖励画面挡住（上次就这样停了，游戏其实还在继续）。
+                # AI 接着会再看几次画面，真的找不到小人（游戏结束）才会停。
+                self.status('⚠ 跳完找不到小人：再看一次…（可能掉下去了）', 'warn')
             return
         e, units = land['err'], jump['units']
         aim = rec.get('aim', 0) or 0
@@ -952,6 +959,13 @@ class App:
         else:
             msg = ('跳过头' if e > 0 else '不够远') + f' {abs(e):.0f}（{pct:+.1f}%）'
         msg += self.calibrate(rec, jump)
+        xs, x_old = learn.x_shift_update(self.cfg, rec), self.cfg.get('x_shift', 0)
+        if xs is not None and xs != x_old:
+            self.store.event('x_shift', old=x_old, new=xs, id=rec['id'])
+            self.cfg['x_shift'] = xs
+            jb.save_config(self.cfg); self.show_info(); self.recalc()
+            msg += f'（没拿到 Perfect、落点偏{"左" if xs > x_old else "右"} → 瞄准修正 {xs:+.0f}）'
+
         self.status('落点：' + msg, 'ok' if abs(pct) < 3 else 'warn')
 
     def calibrate(self, rec, jump):
