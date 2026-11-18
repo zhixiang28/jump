@@ -48,6 +48,11 @@ class App:
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self.esp = None
         self.adb = None
+        self.stream_lock = threading.Lock()
+        self.stream_starts = 0
+        self.stream_tried = 0.0
+        self.stream_watch = False
+        self.closing = False
         self.img = None            # 原始截图 (PIL)
         self.photo = None
         self.scale = 1.0           # 画面像素 / 截图像素
@@ -452,37 +457,87 @@ class App:
         if not self.cfg.get('use_stream', True):
             self.source_info = '截图（影像串流已关闭）'
             return
-        st = stream.ScrcpyStream(self.adb)
-        ok, msg = st.start()
-        if ok:
-            jb.STREAM = st
-            self.source_info = msg
-        else:
-            jb.STREAM = None
-            self.source_info = f'截图（影像串流没开成：{msg}）'
-        self.store.event('stream', ok=ok, msg=msg)
-        self.stream_tried = time.time()
+        with self.stream_lock:
+            old = jb.STREAM
+            if old is not None:
+                old.stop()                           # 旧的手机端小程序、port 转发都关掉再重开
+            t0 = time.time()
+            st = stream.ScrcpyStream(self.adb)
+            ok, msg = st.start()
+            if ok:
+                jb.STREAM = st
+                self.source_info = msg
+            else:
+                jb.STREAM = None
+                self.source_info = f'截图（影像串流没开成：{msg}）'
+            self.stream_starts += 1
+            self.store.event('stream', ok=ok, msg=msg[:300], sec=round(time.time() - t0, 1), n=self.stream_starts)
+            self.stream_tried = time.time()
+            if ok and not self.stream_watch:
+                self.stream_watch = True
+                threading.Thread(target=self.stream_watchdog, daemon=True).start()
+
+    def stream_watchdog(self):
+        """串流一断就马上在背景重开（不用等下一次截图才发现）。连续失败才慢慢拉长间隔。"""
+        fails = 0
+        while not self.closing:
+            time.sleep(0.5)
+            st = jb.STREAM
+            if st is not None and st.alive:
+                fails = 0
+                continue
+            if st is not None and not getattr(st, 'reported', False):
+                st.reported = True
+                self.store.event('stream_lost', err=st.describe_error()[:300], frames=st.frames)
+                self.q.put(lambda: self.status('影像串流断了，背景重新连接中…（这一跳先用截图）', 'warn'))
+            wait = min(30, 2 * fails)               # 0, 2, 4 … 最多 30 秒试一次
+            if time.time() - self.stream_tried < wait:
+                continue
+            self.start_stream()
+            if jb.STREAM is not None and jb.STREAM.alive:
+                fails = 0
+                self.q.put(lambda: self.status(f'影像串流重新连上了（{self.source_info}）', 'ok'))
+            else:
+                fails += 1
 
     def grab_stable(self, tries=8):
         """等画面停下来（镜头还在移动时，跳跃方向会是歪的）：连拍两张差不多才算。"""
+        t0 = time.time()
         st = jb.STREAM
-        if st is not None and not st.alive and time.time() - getattr(self, 'stream_tried', 0) > 30:
-            self.start_stream()                      # 串流断了：每 30 秒最多重开一次
-            st = jb.STREAM
         if st is not None and st.alive:
             im = st.wait_stable()                    # 连续看画面，停下来就马上拿
             if im is not None:
+                self.log_grab(t0, 'stream')
                 return im
+        if self.stream_watch:                        # 串流刚断：背景正在重开，等它一下（通常几秒）比截图快
+            t1 = time.time()
+            while time.time() - t1 < 6 and not (jb.STREAM is not None and jb.STREAM.alive):
+                time.sleep(0.1)
+            st = jb.STREAM
+            if st is not None and st.alive:
+                im = st.wait_stable()
+                if im is not None:
+                    self.log_grab(t0, 'stream_restarted')
+                    return im
         def small(im):
             return np.asarray(im.convert('L').resize((60, 132)), dtype=np.float32)
         a = jb.screenshot(self.adb)
         for _ in range(tries):
+            if time.time() - t0 > 12:                # 截图很慢时不要一直等，拿最后一张
+                break
             time.sleep(0.25)
             b = jb.screenshot(self.adb)
             if float(np.abs(small(a) - small(b)).mean()) < 3.0:   # 雪花在飘只会差一点点
+                self.log_grab(t0, 'screencap')
                 return b
             a = b
+        self.log_grab(t0, 'screencap_unstable')
         return a
+
+    def log_grab(self, t0, how):
+        sec = time.time() - t0
+        if sec > 3 or how != 'stream':
+            self.store.event('grab', how=how, sec=round(sec, 1))
 
     def refresh(self, stable=False):
         if stable and self.adb and not self.grabbing:
@@ -918,7 +973,7 @@ class App:
         if not self.store.recs:
             self.status('还没有资料可以导出（先玩几跳）', 'warn'); return
         self.export_btn.config(state='disabled', text='导出中…')
-        info = {'截图方式': jb.SCREENCAP_INFO}
+        info = {'截图方式': jb.SCREENCAP_INFO, '画面来源': getattr(self, 'source_info', ''), '串流开启次数': self.stream_starts}
         if self.img:
             info['手机截图大小'] = f'{self.img.size[0]}x{self.img.size[1]}'
         self.bg(lambda: learn.export(self.store, dict(self.cfg), info), self.after_export)
@@ -1049,6 +1104,7 @@ def main():
     app = App(root)
 
     def on_close():                                  # 关视窗时把手机的休眠设定还原、关掉串流
+        app.closing = True
         try:
             if jb.STREAM is not None:
                 jb.STREAM.stop()
