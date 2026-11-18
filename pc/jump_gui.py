@@ -155,10 +155,6 @@ class App:
         self.press_btn = btn(c, '按！(空白键)', self.press_line, bg='#3b7cff', fg='#fff',
                              font=('Microsoft YaHei UI', 18, 'bold'))
         self.press_btn.pack(fill='x', pady=(12, 8))
-        fb = tk.Frame(c, bg=CARD); fb.pack(fill='x')
-        btn(fb, '跳太远 (1)', lambda: self.feedback(-1), bg='#d9472f', fg='#fff').pack(side='left', fill='x', expand=True)
-        btn(fb, '✓ 刚好 (2)', self.ok, bg='#1fa955', fg='#fff').pack(side='left', fill='x', expand=True, padx=6)
-        btn(fb, '跳太近 (3)', lambda: self.feedback(1), bg='#d58f12', fg='#fff').pack(side='left', fill='x', expand=True)
         self.v_play = tk.BooleanVar(value=False)
         self.play_btn = btn(c, '🤖 AI 自动玩 (A)', self.toggle_play_btn, bg='#7b3fe4', fg='#fff',
                             font=('Microsoft YaHei UI', 15, 'bold'))
@@ -185,9 +181,11 @@ class App:
                            anchor='w').pack(fill='x')
             return var
         self.v_auto = check(c, '画完自动按', 'gui_auto')
-        self.v_proj = check(c, '只算沿跳跃方向的距离', 'gui_proj', self.recalc)
-        self.v_live = check(c, '自动刷新画面（每 1.5 秒）', 'gui_live')
-        self.v_calib = check(c, '跳完自动量落点、校准 k/b', 'auto_calib')
+        # 这几项一律开着（以前可以关，关掉会影响机器判断）：只算跳跃方向的距离、跳完自动量落点并校准
+        self.cfg.update(gui_proj=True, auto_calib=True, gui_live=False)
+        self.v_proj = tk.BooleanVar(value=True)
+        self.v_live = tk.BooleanVar(value=False)
+        self.v_calib = tk.BooleanVar(value=True)
         self.v_stream = check(c, '用影像串流取得画面（下次开启生效）', 'use_stream')
 
         # 学习卡
@@ -196,8 +194,6 @@ class App:
                                   wraplength=400)
         self.learn_lbl.pack(anchor='w')
         lr = tk.Frame(c, bg=CARD); lr.pack(fill='x', pady=(8, 0))
-        self.fit_btn = btn(lr, '套用拟合 k/b', self.apply_fit, font=FONT)
-        self.fit_btn.pack(side='left')
         btn(lr, '清除学习', self.clear_learn, font=FONT).pack(side='left', padx=6)
         self.export_btn = btn(lr, '📦 导出数据', self.export_data, bg='#2f6f9f', fg='#fff', font=FONT)
         self.export_btn.pack(side='left')
@@ -264,9 +260,6 @@ class App:
                 self.cv.focus_set()
             e.bind('<Return>', save); e.bind('<FocusOut>', save)
             return e
-        self.e_k = entry('k', 'k')
-        self.e_b = entry('b (ms)', 'b')
-        self.e_ang = entry('跳跃角度 (°)', 'jump_angle_deg')
         self.e_wait = entry('按完等几秒', 'wait_after')
         self.e_miss = entry('故意偏离机率 %', 'miss_pct')
         self.e_miss_amt = entry('偏离幅度 0~0.7', 'miss_amount')
@@ -276,9 +269,8 @@ class App:
                  font=('Microsoft YaHei UI', 9), bg=CARD, fg=SUB, justify='left').pack(anchor='w')
         self.info_lbl = tk.Label(c, text='', font=('Microsoft YaHei UI', 10), bg=CARD, fg=SUB, justify='left')
         self.info_lbl.pack(anchor='w', pady=(6, 0))
-        tk.Label(c, text='按压时间 = 距离 × k + b（距离：手机屏幕宽 = 1000）\n\n'
-                         '快捷键：空白键 按 · R 截图 · 右键 清除线\n'
-                         '1 跳太远 · 2 刚好 · 3 跳太近 · A AI 自动玩 · Esc 停止',
+        tk.Label(c, text='按压时间 = 距离 × k + b（距离：手机屏幕宽 = 1000），k、b 由自动校准管理\n\n'
+                         '快捷键：空白键 按 · R 截图 · 右键 清除线 · A AI 自动玩 · Esc 停止',
                  font=('Microsoft YaHei UI', 10), bg=CARD, fg=SUB, justify='left').pack(anchor='w', pady=(8, 0))
 
         self.show_info()
@@ -373,7 +365,16 @@ class App:
         self.st.config(text=t, fg={'ok': '#5fe08f', 'warn': '#ffc14d', 'err': '#ff7b66'}.get(kind, SUB))
 
     def show_info(self):
-        self.info_lbl.config(text=f'调整幅度 ±{self.cfg["step"] * 100:.1f}%')
+        """目前的按压公式（只显示，不能手动改：由自动校准管理）。"""
+        extra = []
+        if self.cfg.get('k_side'):
+            extra.append(f'右上 {self.cfg["k_side"]:+.0f} ms')
+        if self.cfg.get('k_small'):
+            extra.append(f'从小平台起跳 {self.cfg["k_small"]:+.0f} ms')
+        if self.cfg.get('k_foot'):
+            extra.append(f'高度修正 {self.cfg["k_foot"]:+.0f}')
+        self.info_lbl.config(text=f'目前：k = {self.cfg["k"]}，b = {self.cfg["b"]} ms'
+                                  + (f'（{"，".join(extra)}）' if extra else ''), fg=TEXT)
 
     def on_key(self, e):
         if isinstance(self.root.focus_get(), tk.Entry):
@@ -381,9 +382,6 @@ class App:
         k = e.keysym.lower()
         if k == 'space': self.press_line()
         elif k == 'r': self.refresh()
-        elif k in ('1', 'kp_1'): self.feedback(-1)
-        elif k in ('2', 'kp_2'): self.ok()
-        elif k in ('3', 'kp_3'): self.feedback(1)
         elif k == 'a':
             self.toggle_play_btn()
         elif k == 'escape' and self.v_play.get():
@@ -580,7 +578,8 @@ class App:
                 self.units = abs(dot) * 1000 / W
                 self.proj_end = (ax + ux * dot, ay + uy * dot, name)
             side = 1.0 if bx > ax else -1.0
-            self.ms = learn.ms_for(self.units, side, ay / W, self.cfg)
+            cw = (self.pred or {}).get('cur_width')
+            self.ms = learn.ms_for(self.units, side, ay / W, self.cfg, cw)
         if self.units:
             self.ms_lbl.config(text=f'{self.ms} ms')
             if self.proj_end:
@@ -737,7 +736,8 @@ class App:
                 a, b, units = (p['foot'][0] * W, p['foot'][1] * W), pc, p['raw_units']
         dx, dy = b[0] - a[0], b[1] - a[1]
         n = math.hypot(dx, dy) or 1.0
-        return {'dir': (dx / n, dy / n), 'units': units}
+        width = (p or {}).get('width') if p and 'center' in p else None
+        return {'dir': (dx / n, dy / n), 'units': units, 'width': width}
 
     def press(self, ms):
         if self.busy:
@@ -758,75 +758,12 @@ class App:
             return
         if self.cur_rec is not None and self.cur_rec.get('ms') == ms:
             self.cur_rec['t_done'] = round(time.time(), 3)      # ESP 回报按完的时间
-        self.status(f'已按 {ms} ms ✓ 等画面停下来量落点…（也可以按 1 跳太远 / 2 刚好 / 3 跳太近）', 'ok')
+        self.status(f'已按 {ms} ms ✓ 等画面停下来量落点…', 'ok')
 
         def done():
             self.busy = False; self.press_btn.config(state='normal')
             self.line = None; self.recalc(); self.refresh(stable=True)   # 等镜头停下来再截图（才能量落点）
         self.root.after(int(self.cfg['wait_after'] * 1000), done)
-
-    # ------------------------------------------------------------ 校准
-    def feedback(self, d):
-        if not self.last:
-            self.status('先画线按一次，再告诉我跳太远还是跳太近', 'warn'); return
-        if self.v_calib.get():
-            return self.user_result(d)
-        if self.last_dir and d != self.last_dir:
-            self.cfg['step'] = max(0.005, self.cfg['step'] / 2)
-        self.last_dir = d
-        new_ms = self.last['ms'] * (1 + d * self.cfg['step'])
-        self.cfg['k'] = round(max(0.01, (new_ms - self.cfg['b']) / self.last['units']), 4)
-        jb.save_config(self.cfg)
-        self.e_k.delete(0, 'end'); self.e_k.insert(0, str(self.cfg['k']))
-        self.store.set_result(self.cur_rec, d, new_ms); self.update_learn()
-        self.store.event('feedback', id=self.cur_rec and self.cur_rec['id'], result=d, k=self.cfg['k'])
-        self.status(f'{"加长" if d > 0 else "缩短"} {self.cfg["step"] * 100:.1f}%：刚才那条线下次按 {round(new_ms)} ms'
-                    f'（k = {self.cfg["k"]}）', 'ok')
-        self.show_info(); self.recalc()
-
-    def ok(self):
-        if self.v_calib.get() and self.last:
-            return self.user_result(0)
-        if self.last:
-            self.store.set_result(self.cur_rec, 0, self.last['ms']); self.update_learn()
-            self.store.event('feedback', id=self.cur_rec and self.cur_rec['id'], result=0)
-        self.cfg['step'] = max(0.005, self.cfg['step'] / 2); self.last_dir = 0
-        jb.save_config(self.cfg); self.show_info()
-        self.status(f'👍 调整幅度收窄为 ±{self.cfg["step"] * 100:.1f}%', 'ok')
-
-
-    def user_result(self, d):
-        """开着自动校准时，「跳太远 / 刚好 / 跳太近」不直接改 k，而是告诉程序这一跳的结果，
-        交给同一套校准处理（不然两边会互相打架）。同一跳按几次都只算一次。
-        d：-1 跳太远、0 刚好、+1 跳太近。"""
-        rec = self.cur_rec
-        if rec is None:
-            return
-        units = rec['units'] or 1.0
-        names = {-1: '跳太远', 0: '刚好', 1: '跳太近'}
-        L = rec.get('land')
-        if L and not L.get('fell') and not L.get('user'):
-            pct = (L['err'] - (rec.get('aim') or 0)) / units
-            # 量到的落点跟你说的差不多：用量到的（比较精确）；明显矛盾才相信你（可能量错了）
-            conflict = (d == -1 and pct < -0.04) or (d == 1 and pct > 0.04) or (d == 0 and abs(pct) > 0.08)
-            if not conflict:
-                rec['r'] = d
-                self.store.save()
-                self.store.event('feedback', id=rec['id'], result=d, used='measured')
-                self.status(f'已记下：{names[d]}。量到的落点是 {pct * 100:+.1f}%，差不多，以量到的为准（自动校准已经处理）', 'ok')
-                self.update_learn()
-                return
-        # 没量到、掉下去了、或跟量到的矛盾 → 用你说的结果（跳太远 ≈ 远了 6%）
-        traveled = units * (1 - 0.06 * d) + (rec.get('aim') or 0)
-        first = not (L and L.get('user'))
-        rec['land'] = {'err': round(traveled - units, 1), 'traveled': round(traveled, 1), 'user': True}
-        rec['r'] = d
-        self.store.save()
-        self.store.event('feedback', id=rec['id'], result=d, used='user')
-        msg = f'已记下：{names[d]}'
-        if first:                                    # 同一跳按很多次只校准一次
-            msg += self.calibrate(rec, None)
-        self.status(msg, 'ok'); self.update_learn()
 
     # ------------------------------------------------------------ 学习 / AI
     def predict_async(self):
@@ -846,22 +783,35 @@ class App:
         if score is not None and img is self.img:
             self.score = score                       # 读不到（例如通知挡住）就沿用上一次的
         if pend:
-            self.handle_landing(land, pend, img)
+            self.handle_landing(land, pend, img, score)
         if img is not self.img:
             return                                   # 画面已经换了
         if 'units' in p:                             # k/b 可能刚被校准过：用最新的重算 ms
-            p['ms'] = learn.ms_for(p['units'], p['side'], p['foot'][1], self.cfg)
+            p['ms'] = learn.ms_for(p['units'], p['side'], p['foot'][1], self.cfg, p.get('cur_width'))
         self.pred = p
         self.draw(); self.update_learn()
         if self.v_play.get():
             self.root.after(150, self.auto_step)
 
-    def handle_landing(self, land, pend, img=None):
+    def handle_landing(self, land, pend, img=None, score_after=None):
         jump, rec = pend
         self.store.save_after(rec, img)                 # 跳完的画面也存起来（导出用）
-        self.store.event('landing', id=rec['id'], result=land)
+        # 游戏自己的判定：分数一次加 5 分以上 = Perfect（落在中心附近）。比任何影像量测都可靠。
+        before = rec.get('score')
+        gain = (score_after - before) if (score_after is not None and before is not None) else None
+        perfect = gain is not None and 5 <= gain <= 40
+        if gain is not None and 0 <= gain <= 40:
+            rec['score_gain'] = gain
+        units = jump['units']
+        if perfect and land is not None and not land.get('lost'):
+            if 'err' not in land or abs(land['err']) / max(1.0, units) > 0.06:
+                # 量到的跟游戏说的不一样（量错了）→ 以游戏为准：落在中心
+                land = {'err': 0.0, 'traveled': units, 'perfect_fix': True}
+        elif perfect and land is None:
+            land = {'err': 0.0, 'traveled': units, 'perfect_fix': True}   # 没量到，但游戏说是 Perfect
+        self.store.event('landing', id=rec['id'], result=land, gain=gain)
         if land is None:
-            self.status('量不到这一跳的落点（这块没有奶油色顶面），可以按 1/2/3 告诉我结果', 'warn'); return
+            self.status('量不到这一跳的落点（看不到小人脚下的顶面），这跳不拿来校准', 'warn'); return
         if land.get('lost'):
             if rec.get('end_game'):
                 self.status(f'🏁 目标分数达成，这一局已结束（最后分数 {rec.get("score")}）', 'ok')
@@ -874,19 +824,21 @@ class App:
         aim = rec.get('aim', 0) or 0
         e_rel = e - aim                                # 扣掉故意偏离的量
         rec['land'] = {'err': round(e, 1), 'traveled': round(land['traveled'], 1),
-                       'foot': land.get('foot'), 'face': land.get('face'), 'score': land.get('score')}
+                       'foot': land.get('foot'), 'face': land.get('face'), 'score': land.get('score'),
+                       'perfect': perfect, 'perfect_fix': bool(land.get('perfect_fix'))}
         if rec.get('r') is None:                     # 自动填结果（你按 1/2/3 会覆盖）
             pct = e_rel / max(1.0, units)
             rec['r'] = 0 if abs(pct) < 0.03 else (-1 if pct > 0 else 1)
             rec['est'] = int(round(rec['ms'] * units / max(1.0, land['traveled'])))
         self.store.save()
         pct = e_rel / max(1.0, units) * 100
-        if aim:
+        if perfect:
+            msg = f'🎯 Perfect（+{gain}）' + ('' if land.get('perfect_fix') else f'，量到 {pct:+.1f}%')
+        elif aim:
             msg = (f'故意{"偏远" if aim > 0 else "偏近"} {abs(aim):.0f}，实际 {e:+.0f}（跟瞄的点差 {pct:+.1f}%）')
         else:
-            msg = ('🎯 几乎正中' if abs(pct) < 2 else ('跳过头' if e > 0 else '不够远')) + f' {abs(e):.0f}（{pct:+.1f}%）'
-        if self.v_calib.get():
-            msg += self.calibrate(rec, jump)
+            msg = ('跳过头' if e > 0 else '不够远') + f' {abs(e):.0f}（{pct:+.1f}%）'
+        msg += self.calibrate(rec, jump)
         self.status('落点：' + msg, 'ok' if abs(pct) < 3 else 'warn')
 
     def calibrate(self, rec, jump):
@@ -904,8 +856,7 @@ class App:
         self.store.event('calibrate', k_old=self.cfg['k'], b_old=self.cfg['b'], how=how, **new)
         self.cfg.update(new)
         jb.save_config(self.cfg)
-        for e, key in ((self.e_k, 'k'), (self.e_b, 'b')):
-            e.delete(0, 'end'); e.insert(0, str(self.cfg[key]))
+        self.show_info()
         self.recalc()
         side_txt = f'，右上 {self.cfg["k_side"]:+.0f} ms' if self.cfg.get('k_side') else ''
         return f' {alarm}→ k = {self.cfg["k"]}, b = {self.cfg["b"]}{side_txt}{how}'
@@ -917,8 +868,7 @@ class App:
             self.cfg.update(k=learn.K_DEFAULT, b=learn.B_DEFAULT, k_side=0, k_foot=0)
         jb.save_config(self.cfg)
         self.store.event('device_changed', k=self.cfg['k'], b=self.cfg['b'])
-        for e, key in ((self.e_k, 'k'), (self.e_b, 'b')):
-            e.delete(0, 'end'); e.insert(0, str(self.cfg[key]))
+        self.show_info()
         self.recalc(); self.update_learn()
         self.status('🔧 已标记：装置调整过。接下来几跳会快速重新校准（先修 b，资料够了再一起修 k）', 'ok')
 
@@ -947,29 +897,13 @@ class App:
         if ls:
             lines.append(f'落点（最近 {ls["n"]} 跳）：平均偏 {ls["mean"] * 100:.1f}%，上一跳 {ls["last"]:+.0f}'
                          f'（共量到 {learn.land_count(self.store)} 跳）')
-        f = learn.fit_kb(self.store)
-        self.fit = f if 'k' in f else None
-        if self.fit:
-            lines.append(f'拟合 k = {f["k"]:.4f}，b = {f["b"]:.0f} ms（{f["n"]} 笔，误差 ±{f["rms"]:.0f} ms）')
-        elif f.get('bad'):
-            lines.append(f'有结果的 {f["n"]} 笔，但远近太接近，多跳几种距离才能拟合 k/b')
-        else:
-            lines.append(f'有结果的 {f["n"]} 笔（按 1/2/3），满 8 笔就能拟合 k/b')
+        pf = [r for r in self.store.recs[-30:] if r.get('score_gain') is not None]
+        if pf:
+            n_p = sum(1 for r in pf if r['score_gain'] >= 5)
+            lines.append(f'最近 {len(pf)} 跳里 Perfect {n_p} 跳（{n_p / len(pf) * 100:.0f}%）')
         self.learn_lbl.config(text='\n'.join(lines))
-        # 开着自动校准时停用：这个拟合是用 1/2/3 的粗略结果算的，会跟自动校准打架
-        self.fit_btn.config(state='normal' if self.fit and not self.v_calib.get() else 'disabled')
         self.draw_chart()
         self.update_history()
-
-    def apply_fit(self):
-        if not self.fit:
-            return
-        self.cfg['k'] = round(self.fit['k'], 4); self.cfg['b'] = round(self.fit['b'])
-        jb.save_config(self.cfg)
-        for e, key in ((self.e_k, 'k'), (self.e_b, 'b')):
-            e.delete(0, 'end'); e.insert(0, str(self.cfg[key]))
-        self.recalc(); self.predict_async()
-        self.status(f'已套用拟合：k = {self.cfg["k"]}，b = {self.cfg["b"]} ms', 'ok')
 
     def export_data(self):
         if not self.store.recs:
@@ -1057,7 +991,7 @@ class App:
             aim = self.pick_aim(p, force=True)       # 快到了：大平台故意不跳正中，只拿 +1，不要一下子超过太多
         else:
             aim = self.pick_aim(p)
-        ms = learn.ms_for(p['units'] + aim, p['side'], p['foot'][1], self.cfg)
+        ms = learn.ms_for(p['units'] + aim, p['side'], p['foot'][1], self.cfg, p.get('cur_width'))
         if self.press(ms):
             if ending:
                 self.status(f'🏁 已到目标分数 {target}（现在 {self.score}）：故意失误，结束这一局', 'ok')

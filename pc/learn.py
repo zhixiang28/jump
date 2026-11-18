@@ -71,7 +71,8 @@ class Store:
                'units': round(units, 1), 'ms': int(ms), 'auto': bool(auto),
                'r': None, 'est': None,
                'pred': ({'units': round(pred['units'], 1), 'score': round(pred['score'], 3),
-                         'foot': [round(v, 4) for v in pred['foot']], 'center': [round(v, 4) for v in pred['center']]}
+                         'foot': [round(v, 4) for v in pred['foot']], 'center': [round(v, 4) for v in pred['center']],
+                         'width': round(pred.get('width') or 0, 3), 'cur_width': round(pred.get('cur_width') or 0, 3)}
                         if pred and 'foot' in pred else None)}
         if extra:
             rec.update({k: v for k, v in extra.items() if k not in rec})   # 不覆盖原本的栏位
@@ -417,25 +418,50 @@ def cream_mask(img):
     return (r > 225) & (g > 205) & (b > 165) & (r - b > 18) & (r - b < 80) & (r - g > 3) & (r - g < 30)
 
 
-def standing_face(im, foot):
-    """小人现在站的那块顶面的中心（屏宽比例）。小人会挡住顶面中间，
-    所以用顶面最左、最右两个点：菱形和椭圆的左右端点都在中心高度，中点就是中心。"""
+def standing_face(im, foot, expect_width=None):
+    """小人现在站的那块顶面的中心（屏宽比例）。
+    - 只取「脚底下」那块顶面：在脚的周围一圈找奶油色，旁边别的方块（例如后面的炸鸡盘）不会混进来。
+      金币那种顶面不是奶油色的：脚下找不到就回传 None（不量，比量错好）。
+    - 小人会挡住顶面中间，所以用顶面最左、最右两点（菱形 / 椭圆的左右端点都在中心高度）。
+    - 顶面被萤幕边缘切掉一半时：用看得到的那一边 + 跳之前量到的顶面宽度（expect_width）推算中心。"""
     Wn = NW // 2
     img = as_arr(im, Wn)
     fx, fy = foot[0] * Wn, foot[1] * Wn
     cream = cream_mask(img)
     lab, sizes = _label(_dilate(cream))
-    ya, yb = max(0, int(fy - 0.10 * Wn)), int(fy + 0.06 * Wn)
-    xa, xb = max(0, int(fx - 0.15 * Wn)), int(fx + 0.15 * Wn)
-    labs = [int(v) for v in np.unique(lab[ya:yb, xa:xb]) if v and sizes[int(v)] >= 0.001 * Wn * Wn]
+    H = lab.shape[0]
+    hits = {}
+    for ang in np.linspace(-0.15 * np.pi, 1.15 * np.pi, 24):       # 脚的左、右、前方一圈（后面被身体挡住）
+        for rad in (0.035, 0.05, 0.065):
+            x = int(round(fx + np.cos(ang) * rad * Wn))
+            y = int(round(fy + np.sin(ang) * rad * Wn * 0.55))
+            if 0 <= x < Wn and 0 <= y < H and lab[y, x]:
+                L = int(lab[y, x])
+                hits[L] = hits.get(L, 0) + 1
+    labs = [L for L, n in hits.items() if n >= 3 and sizes[L] >= 0.001 * Wn * Wn]
     if not labs:
-        return None                                    # 没有奶油色顶面（例如金币）
+        return None                                    # 脚下没有奶油色顶面（例如金币）
     m = np.isin(lab, labs) & cream
     ys, xs = np.nonzero(m)
-    if xs.max() - xs.min() < 0.15 * Wn or (ys.max() - ys.min()) / (xs.max() - xs.min()) > 0.9:
+    keep = np.abs(xs - fx) <= 0.30 * Wn                # 保险：离脚太远的不算
+    ys, xs = ys[keep], xs[keep]
+    if len(xs) < 20:
+        return None
+    xl, xr = int(xs.min()), int(xs.max())
+    cut_l, cut_r = xl <= 1, xr >= Wn - 2
+    if (cut_l or cut_r) and expect_width:
+        half = expect_width * Wn / 2
+        if cut_l and not cut_r:
+            cx, cy = xr - half, float(ys[xs >= xr - 1].min())
+        elif cut_r and not cut_l:
+            cx, cy = xl + half, float(ys[xs <= xl + 1].min())
+        else:
+            return None
+        return {'center': (cx / Wn, cy / Wn), 'width': expect_width, 'cut': True}
+    if xr - xl < 0.12 * Wn or (ys.max() - ys.min()) / (xr - xl) > 0.9:
         return None
     cx, cy = face_center_extremes(ys, xs)
-    return {'center': (cx / Wn, cy / Wn), 'width': (xs.max() - xs.min()) / Wn}
+    return {'center': (cx / Wn, cy / Wn), 'width': (xr - xl) / Wn}
 
 
 def landing(im, tpls, jump, ch=None):
@@ -446,7 +472,7 @@ def landing(im, tpls, jump, ch=None):
         return {'lost': True}                           # 找不到小人：可能掉下去了 / 游戏结束
     if not ch.get('ok'):
         return None                                     # 不太确定是不是小人：这跳不量
-    face = standing_face(im, ch['foot'])
+    face = standing_face(im, ch['foot'], jump.get('width'))
     if not face:
         return None
     ux, uy = jump['dir']
@@ -717,10 +743,13 @@ def predict(im, tpls, cfg, store, char_thr=0.55, ch=None, mem=None):
     # 依你的画线习惯修正比例；一旦有足够的落点资料（真正的物理结果），就不需要了
     corr = st['ratio'] if st['n'] >= 5 and land_count(store) < MIN_LAND else 1.0
     units = raw_units * corr
-    ms = ms_for(units, tg['side'], fy, cfg)
+    cur = standing_face(im, ch['foot'])                   # 小人现在站的方块（小平台通常比较矮，跳法不太一样）
+    cur_w = cur['width'] if cur else 0.0
+    ms = ms_for(units, tg['side'], fy, cfg, cur_w)
     return {'foot': ch['foot'], 'center': tg['center'], 'top': tg['top'], 'side': tg['side'],
             'score': ch['score'], 'raw_units': raw_units, 'units': units, 'corr': corr, 'ms': ms, 'angle': ang,
-            'width': tg.get('width', 0), 'method': tg.get('method', 'face'), 'mem_score': tg.get('mem_score')}
+            'width': tg.get('width', 0), 'method': tg.get('method', 'face'), 'mem_score': tg.get('mem_score'),
+            'cur_width': cur_w}
 
 
 MIN_LAND = 6
@@ -734,10 +763,14 @@ def _jump_side(r):
     return 1.0 if (r['b'][0] - r['a'][0]) > 0 else -1.0
 
 
-def ms_for(units, side, foot_y, cfg):
-    """按压时间 = k × 距离 + b（+ 左右方向修正 + 小人高度修正，自动校准学到才有）。回传整数 ms。"""
+SMALL_FACE = 0.22    # 顶面宽度小于屏宽的 22% = 小平台（通常也比较矮）
+
+
+def ms_for(units, side, foot_y, cfg, cur_width=None):
+    """按压时间 = k × 距离 + b（+ 左右方向修正 + 小人高度修正 + 从小平台起跳的修正，自动校准学到才有）。"""
+    small = 1.0 if (cur_width and cur_width < SMALL_FACE) else 0.0
     ms = (units * cfg['k'] + cfg['b'] + cfg.get('k_side', 0) * side
-          + cfg.get('k_foot', 0) * (foot_y - cfg.get('foot0', foot_y)))
+          + cfg.get('k_foot', 0) * (foot_y - cfg.get('foot0', foot_y)) + cfg.get('k_small', 0) * small)
     return int(round(max(cfg.get('min_ms', 150), min(cfg.get('max_ms', 2500), ms))))
 
 
@@ -784,10 +817,13 @@ def fit_land(store, n=80, cfg=None):
     ms = np.array([r['ms'] for r in rs], float)
     side = np.array([_jump_side(r) for r in rs])
     fy = np.array([r['a'][1] for r in rs], float)
+    cw = np.array([((r.get('pred') or {}).get('cur_width') or 0) for r in rs], float)
+    small = ((cw > 0) & (cw < SMALL_FACE)).astype(float)
     f0 = float(np.median(fy))
     if ms.max() - ms.min() < MS_SPREAD_FOR_B:
         b = float(cfg.get('b', 150))
-        u = ms - b - cfg.get('k_side', 0) * side - cfg.get('k_foot', 0) * (fy - cfg.get('foot0', f0))
+        u = (ms - b - cfg.get('k_side', 0) * side - cfg.get('k_foot', 0) * (fy - cfg.get('foot0', f0))
+             - cfg.get('k_small', 0) * small)
         keep = np.ones(len(t), bool)
         for _ in range(2):
             a = float((u[keep] * t[keep]).sum() / max(1e-6, (u[keep] ** 2).sum()))
@@ -798,14 +834,18 @@ def fit_land(store, n=80, cfg=None):
         k = 1.0 / a
         rms_t = float(np.sqrt(((a * u[keep] - t[keep]) ** 2).mean()))
         return {'k': k, 'b': b, 'k_side': cfg.get('k_side', 0.0), 'k_foot': cfg.get('k_foot', 0.0),
-                'foot0': cfg.get('foot0', f0), 'terms': 'k-only', 'rms': rms_t * k, 'cv': rms_t * k,
-                'n': int(keep.sum())}
+                'k_small': cfg.get('k_small', 0.0), 'foot0': cfg.get('foot0', f0), 'terms': 'k-only',
+                'rms': rms_t * k, 'cv': rms_t * k, 'n': int(keep.sum())}
 
     cols = {'base': [ms, np.ones_like(ms)]}
     if len(rs) >= 30 and (side > 0).sum() >= 8 and (side < 0).sum() >= 8:
         cols['side'] = cols['base'] + [side]
         if len(rs) >= 40:
             cols['side+foot'] = cols['side'] + [fy - f0]
+    if len(rs) >= 30 and small.sum() >= 6:               # 有够多「从小平台起跳」的资料
+        cols['small'] = cols['base'] + [small]
+        if 'side' in cols:
+            cols['side+small'] = cols['side'] + [small]
 
     def cv_rms(c):
         X = np.vstack(c).T
@@ -821,10 +861,10 @@ def fit_land(store, n=80, cfg=None):
         return float(np.sqrt((e ** 2).mean()))
 
     best, best_cv = 'base', cv_rms(cols['base'])
-    for name in ('side', 'side+foot'):
+    for name in ('side', 'small', 'side+small', 'side+foot'):
         if name in cols:
             cv = cv_rms(cols[name])
-            if cv < best_cv * 0.95:
+            if cv < best_cv * 0.95:                      # 至少准 5% 才值得多学一项
                 best, best_cv = name, cv
     X = np.vstack(cols[best]).T
     w, keep = _robust_lstsq(X, t, MIN_LAND)
@@ -832,9 +872,12 @@ def fit_land(store, n=80, cfg=None):
         return None
     a, c = float(w[0]), float(w[1])
     k, b = 1.0 / a, -c / a
+    names = {'base': [], 'side': ['side'], 'small': ['small'], 'side+small': ['side', 'small'],
+             'side+foot': ['side', 'foot']}[best]
+    coef = {n: -float(w[2 + j]) / a for j, n in enumerate(names)}
     rms_t = float(np.sqrt(((X[keep] @ w - t[keep]) ** 2).mean()))
-    return {'k': k, 'b': b, 'k_side': -float(w[2]) / a if len(w) > 2 else 0.0,
-            'k_foot': -float(w[3]) / a if len(w) > 3 else 0.0, 'foot0': f0, 'terms': best,
+    return {'k': k, 'b': b, 'k_side': coef.get('side', 0.0), 'k_foot': coef.get('foot', 0.0),
+            'k_small': coef.get('small', 0.0), 'foot0': f0, 'terms': best,
             'rms': rms_t * k, 'cv': best_cv * k, 'n': int(keep.sum())}
 
 
@@ -843,15 +886,18 @@ def calibration_update(store, cfg, rec):
     f = fit_land(store, cfg=cfg)
     fresh = len(_land_recs(store, cfg, 999)) < 15           # 刚重新校准：允许变化大一点
     if f and f['rms'] < (60 if fresh else 30):           # 刚重新校准时资料比较乱，也先用（下面有每次变动上限）
-        new = {'k': f['k'], 'b': f['b'], 'k_side': f['k_side'], 'k_foot': f['k_foot'], 'foot0': f['foot0']}
-        terms = {'base': '', 'side': ' + 左右修正', 'side+foot': ' + 左右修正 + 高度修正',
-                 'k-only': '（只调 k）'}[f['terms']]
+        new = {'k': f['k'], 'b': f['b'], 'k_side': f['k_side'], 'k_foot': f['k_foot'], 'foot0': f['foot0'],
+               'k_small': f.get('k_small', 0.0)}
+        terms = {'base': '', 'side': ' + 左右修正', 'side+foot': ' + 左右修正 + 高度修正', 'small': ' + 小平台修正',
+                 'side+small': ' + 左右修正 + 小平台修正', 'k-only': '（只调 k）'}[f['terms']]
         how = f'（{f["n"]} 跳拟合{terms}，误差 ±{f["rms"]:.0f} ms）'
     else:
         traveled = rec['land']['traveled']
         if traveled < 50:
             return None, ''
-        corr = (cfg.get('k_side', 0) * _jump_side(rec) + cfg.get('k_foot', 0) * (rec['a'][1] - cfg.get('foot0', rec['a'][1])))
+        cw = (rec.get('pred') or {}).get('cur_width') or 0
+        corr = (cfg.get('k_side', 0) * _jump_side(rec) + cfg.get('k_foot', 0) * (rec['a'][1] - cfg.get('foot0', rec['a'][1]))
+                + cfg.get('k_small', 0) * (1.0 if 0 < cw < SMALL_FACE else 0.0))
         miss = rec['ms'] - (cfg['k'] * traveled + cfg['b'] + corr)       # 这跳多按（+）或少按（−）了几 ms
         b_try = cfg['b'] + 0.7 * miss
         if fresh and B_RANGE[0] <= b_try <= B_RANGE[1]:
@@ -870,7 +916,7 @@ def calibration_update(store, cfg, rec):
         b_old = cfg['b']
         db = 120 if fresh else 40
         new['b'] = float(min(B_RANGE[1], max(B_RANGE[0], min(b_old + db, max(b_old - db, new['b'])))))
-    new = {key: (round(v, 4) if key in ('k', 'foot0') else round(v, 1) if key in ('k_side', 'k_foot') else round(v))
+    new = {key: (round(v, 4) if key in ('k', 'foot0') else round(v, 1) if key in ('k_side', 'k_foot', 'k_small') else round(v))
            for key, v in new.items()}
     return new, how
 
