@@ -13,12 +13,15 @@
      并在你玩的时候偷偷预测（紫色虚线），跟你画的比较；够准了再打开「AI 自动玩」。
 """
 import asyncio
+import json
 import math
 import os
 import subprocess
 import sys
 import queue
 import random
+import re
+import shutil
 import threading
 import time
 import tkinter as tk
@@ -85,7 +88,7 @@ class App:
         self.cfg.setdefault('miss_pct', 10)        # AI 自动玩时，故意不跳正中的机率（%）
         self.cfg.setdefault('miss_amount', 0.6)    # 故意偏离最多到「中心→边缘」距离的几成
         self.cfg.setdefault('target_score', 0)     # 目标分数：AI 自动玩到这个分数就故意失误结束（0 = 不限）
-        self.reset_msg = ''
+        self.reset_msg = getattr(root, 'restore_note', '')
         self.cfg['k_foot'] = 0                     # 「小人高度修正」已经拿掉（不稳定）
         if 'x_shift' not in self.cfg:              # 瞄准左右修正：第一次用从以前 Perfect 的那几跳估起始值
             self.cfg['x_shift'] = learn.x_shift_initial(self.store)
@@ -1179,6 +1182,54 @@ class App:
         return random.uniform(lo, hi) * random.choice((-1, 1))
 
 
+def restore_from_profiles():
+    """有一版把设定分手机放在 pc/profiles/<手机>/。改回只有一支手机：把最近用的那支的设定和纪录搬回 pc/。
+    原本 pc/ 底下的先改名留着（.before_restore），只做一次（index.json 改名成 index.json.restored）。"""
+    here = jb.HERE
+    idx_path = os.path.join(here, 'profiles', 'index.json')
+    if not os.path.exists(idx_path):
+        return ''
+    try:
+        with open(idx_path, encoding='utf-8') as f:
+            idx = json.load(f)
+        def folder(k):
+            return os.path.join(here, 'profiles', re.sub(r'[^A-Za-z0-9._-]', '_', k)[:60] or 'phone')
+
+        def jumps(k):
+            try:
+                with open(os.path.join(folder(k), 'data', 'log.json'), encoding='utf-8') as f:
+                    return len(json.load(f))
+            except Exception:  # noqa: BLE001
+                return 0
+        # 用现在插着的那支手机；没插（或插的是没纪录的）就用纪录最多的那支
+        last = None
+        try:
+            adb = jb.find_adb(jb.load_config())
+            out = subprocess.run([adb, 'devices'], capture_output=True, text=True, timeout=10).stdout if adb else ''
+            now = [l.split()[0] for l in out.splitlines()[1:] if l.strip().endswith('device')]
+            last = next((k for k in now if k in idx), None)
+        except Exception:  # noqa: BLE001
+            pass
+        last = last or max(idx, key=jumps)
+        src = folder(last)
+        if not os.path.exists(os.path.join(src, 'jump_config.json')):
+            return ''
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        cfg = os.path.join(here, 'jump_config.json')
+        if os.path.exists(cfg):
+            os.replace(cfg, f'{cfg}.before_restore-{stamp}')
+        shutil.copy2(os.path.join(src, 'jump_config.json'), cfg)
+        if os.path.isdir(os.path.join(src, 'data')):
+            data = os.path.join(here, 'data')
+            if os.path.isdir(data):
+                os.replace(data, f'{data}.before_restore-{stamp}')
+            shutil.copytree(os.path.join(src, 'data'), data)
+        os.replace(idx_path, idx_path + '.restored')
+        return f'已改回只有一支手机：沿用 {idx[last].get("model") or last} 的设定和学习纪录'
+    except Exception as e:  # noqa: BLE001
+        return f'搬回手机设定时出错（{e}），用 pc 资料夹里原本的设定'
+
+
 def main():
     try:   # Windows 高解析度萤幕：避免视窗模糊、座标偏移
         import ctypes
@@ -1186,6 +1237,7 @@ def main():
     except Exception:  # noqa: BLE001
         pass
     root = tk.Tk()
+    root.restore_note = restore_from_profiles()
     app = App(root)
 
     def on_close():                                  # 关视窗时把手机的休眠设定还原、关掉串流、断开蓝牙
