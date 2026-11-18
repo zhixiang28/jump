@@ -20,6 +20,8 @@ import subprocess
 import sys
 import queue
 import random
+import re
+import shutil
 import threading
 import time
 import tkinter as tk
@@ -30,7 +32,6 @@ from PIL import Image, ImageTk
 
 import jump_bot as jb
 import learn
-import profiles
 import stream
 
 FONT = ('Microsoft YaHei UI', 11)
@@ -42,8 +43,6 @@ CARD = '#1d2026'
 class App:
     def __init__(self, root):
         self.root = root
-        self.phone = getattr(root, 'phone_name', '')   # 这支手机的设定（profiles.py）
-        self.phone_note = getattr(root, 'phone_note', '')
         self.cfg = jb.load_config()
         for k, v in {'gui_auto': False, 'gui_proj': True, 'gui_live': False}.items():
             self.cfg.setdefault(k, v)
@@ -89,7 +88,7 @@ class App:
         self.cfg.setdefault('miss_pct', 10)        # AI 自动玩时，故意不跳正中的机率（%）
         self.cfg.setdefault('miss_amount', 0.6)    # 故意偏离最多到「中心→边缘」距离的几成
         self.cfg.setdefault('target_score', 0)     # 目标分数：AI 自动玩到这个分数就故意失误结束（0 = 不限）
-        self.reset_msg = ''
+        self.reset_msg = getattr(root, 'restore_note', '')
         self.cfg['k_foot'] = 0                     # 「小人高度修正」已经拿掉（不稳定）
         if 'x_shift' not in self.cfg:              # 瞄准左右修正：第一次用从以前 Perfect 的那几跳估起始值
             self.cfg['x_shift'] = learn.x_shift_initial(self.store)
@@ -113,7 +112,7 @@ class App:
     # ------------------------------------------------------------ 介面
     def build(self):
         r = self.root
-        r.title('Servo Press · ' + (self.phone or '手机画面画线'))
+        r.title('Servo Press · 手机画面画线')
         r.configure(bg=BG)
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
         self.wide = sw >= 1150                     # 够宽就三栏；太窄就两栏（右边捲动）
@@ -462,8 +461,7 @@ class App:
             self.status(str(err or err_msg), 'err'); return
         self.refresh()
         src = getattr(self, 'source_info', '') or f'截图（{jb.SCREENCAP_INFO}）'
-        phone = f'手机：{self.phone}' + (f'（{self.phone_note}）' if self.phone_note else '') + '\n' if self.phone else ''
-        self.status(phone + (self.reset_msg or f'画面来源：{src}'), 'warn' if (self.reset_msg or self.phone_note) else 'ok')
+        self.status(self.reset_msg or f'画面来源：{src}', 'warn' if self.reset_msg else 'ok')
 
     def start_stream(self):
         """开影像串流（背景执行绪里呼叫）。失败就用原本的截图方式。"""
@@ -731,13 +729,7 @@ class App:
         self.bt.config(text='🔗 已连接', bg='#1fa955', state='normal')
         esp.on_angles = lambda r, p: self.q.put(lambda: self.got_angles(r, p))   # 蓝牙执行绪 → 介面
         esp.on_lost = lambda: self.q.put(lambda: self.ble_lost(esp, '蓝牙断开'))
-        addr = getattr(esp, 'address', '')
-        if addr and addr != self.cfg.get('ble_addr'):
-            self.cfg['ble_addr'] = addr                  # 记住这支手机用哪块板子
-            jb.save_config(self.cfg)
-        # 每支手机的 servo 角度不一样：先把这支手机的角度写到板子，再读回来确认
-        r_, p_ = int(self.cfg.get('servo_rest', 0)), int(self.cfg.get('servo_push', 90))
-        self.bg_async(esp.send(f'A{r_},{p_}'), lambda _, err: self.bg_async(esp.send('G'), lambda *a: None))
+        self.bg_async(esp.send('G'), lambda _, err: None)                      # 读板子上的角度
         if self.ble_retry:
             self.store.event('ble_reconnect', ok=True, tries=self.ble_retry)
         resume, self.ble_retry, self.ble_resume = self.ble_resume, 0, False
@@ -1069,7 +1061,7 @@ class App:
         if not self.store.recs:
             self.status('还没有资料可以导出（先玩几跳）', 'warn'); return
         self.export_btn.config(state='disabled', text='导出中…')
-        info = {'手机': self.phone, '截图方式': jb.SCREENCAP_INFO, '画面来源': getattr(self, 'source_info', ''), '串流开启次数': self.stream_starts}
+        info = {'截图方式': jb.SCREENCAP_INFO, '画面来源': getattr(self, 'source_info', ''), '串流开启次数': self.stream_starts}
         if self.img:
             info['手机截图大小'] = f'{self.img.size[0]}x{self.img.size[1]}'
         self.bg(lambda: learn.export(self.store, dict(self.cfg), info), self.after_export)
@@ -1190,43 +1182,52 @@ class App:
         return random.uniform(lo, hi) * random.choice((-1, 1))
 
 
-def choose_phone(root):
-    """认手机、切到那支手机的设定。两支都插着就让你选。"""
+def restore_from_profiles():
+    """有一版把设定分手机放在 pc/profiles/<手机>/。改回只有一支手机：把最近用的那支的设定和纪录搬回 pc/。
+    原本 pc/ 底下的先改名留着（.before_restore），只做一次（index.json 改名成 index.json.restored）。"""
+    here = jb.HERE
+    idx_path = os.path.join(here, 'profiles', 'index.json')
+    if not os.path.exists(idx_path):
+        return ''
     try:
-        with open(profiles.LEGACY_CONFIG, encoding='utf-8') as f:
-            adb_cfg = json.load(f)
-    except Exception:  # noqa: BLE001
-        adb_cfg = {}
-    adb = jb.find_adb(adb_cfg)
-    devs = [d for d in profiles.list_devices(adb) if d['state'] == 'device'] if adb else []
-    pick = None
-    if len(devs) == 1:
-        pick = devs[0]
-    elif len(devs) > 1:
-        root.withdraw()
-        win = tk.Toplevel(root)
-        win.title('选择手机')
-        win.configure(bg=BG, padx=24, pady=18)
-        tk.Label(win, text='接着两支以上的手机，这次要用哪一支？', font=FONT_B, bg=BG, fg=TEXT).pack(pady=(0, 12))
-        idx = profiles.load_index()
-        res = {}
-        for d in devs:
-            label = profiles.display_name(d['serial'], d['model']) + ('' if d['serial'] in idx else '（第一次用）')
-            tk.Button(win, text=label, font=FONT_B, bg='#3b7cff', fg='#fff', relief='flat', padx=14, pady=8,
-                      command=lambda d=d: (res.update(d=d), win.destroy())).pack(fill='x', pady=4)
-        win.protocol('WM_DELETE_WINDOW', win.destroy)
-        root.wait_window(win)
-        pick = res.get('d') or devs[0]
-        root.deiconify()
-    if pick is None:                                 # 没接手机：先用上次那支的设定（接上后重开程式）
-        serial, model = profiles.last_used()
-        if serial is None:
-            return
-        pick = {'serial': serial, 'model': model}
-    d, name, note = profiles.activate(pick['serial'], pick['model'])
-    jb.CONFIG_PATH = os.path.join(d, 'jump_config.json')
-    learn.set_data_dir(os.path.join(d, 'data'))
-    root.phone_name, root.phone_note = name, note
+        with open(idx_path, encoding='utf-8') as f:
+            idx = json.load(f)
+        def folder(k):
+            return os.path.join(here, 'profiles', re.sub(r'[^A-Za-z0-9._-]', '_', k)[:60] or 'phone')
+
+        def jumps(k):
+            try:
+                with open(os.path.join(folder(k), 'data', 'log.json'), encoding='utf-8') as f:
+                    return len(json.load(f))
+            except Exception:  # noqa: BLE001
+                return 0
+        # 用现在插着的那支手机；没插（或插的是没纪录的）就用纪录最多的那支
+        last = None
+        try:
+            adb = jb.find_adb(jb.load_config())
+            out = subprocess.run([adb, 'devices'], capture_output=True, text=True, timeout=10).stdout if adb else ''
+            now = [l.split()[0] for l in out.splitlines()[1:] if l.strip().endswith('device')]
+            last = next((k for k in now if k in idx), None)
+        except Exception:  # noqa: BLE001
+            pass
+        last = last or max(idx, key=jumps)
+        src = folder(last)
+        if not os.path.exists(os.path.join(src, 'jump_config.json')):
+            return ''
+        stamp = time.strftime('%Y%m%d-%H%M%S')
+        cfg = os.path.join(here, 'jump_config.json')
+        if os.path.exists(cfg):
+            os.replace(cfg, f'{cfg}.before_restore-{stamp}')
+        shutil.copy2(os.path.join(src, 'jump_config.json'), cfg)
+        if os.path.isdir(os.path.join(src, 'data')):
+            data = os.path.join(here, 'data')
+            if os.path.isdir(data):
+                os.replace(data, f'{data}.before_restore-{stamp}')
+            shutil.copytree(os.path.join(src, 'data'), data)
+        os.replace(idx_path, idx_path + '.restored')
+        return f'已改回只有一支手机：沿用 {idx[last].get("model") or last} 的设定和学习纪录'
+    except Exception as e:  # noqa: BLE001
+        return f'搬回手机设定时出错（{e}），用 pc 资料夹里原本的设定'
 
 
 def main():
@@ -1236,7 +1237,7 @@ def main():
     except Exception:  # noqa: BLE001
         pass
     root = tk.Tk()
-    choose_phone(root)
+    root.restore_note = restore_from_profiles()
     app = App(root)
 
     def on_close():                                  # 关视窗时把手机的休眠设定还原、关掉串流、断开蓝牙
