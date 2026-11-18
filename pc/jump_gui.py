@@ -29,6 +29,7 @@ from PIL import Image, ImageTk
 
 import jump_bot as jb
 import learn
+import stream
 
 FONT = ('Microsoft YaHei UI', 11)
 FONT_B = ('Microsoft YaHei UI', 11, 'bold')
@@ -71,6 +72,7 @@ class App:
         self.shot_fail = 0         # 连续截图失败次数
         self.awake_old = None      # 手机原本的「接着电源不休眠」设定（结束时还原）
         self.cfg.setdefault('auto_calib', True)
+        self.cfg.setdefault('use_stream', True)    # 用 scrcpy 影像串流取得画面（不会像截图那样卡住）
         self.cfg.setdefault('miss_pct', 10)        # AI 自动玩时，故意不跳正中的机率（%）
         self.cfg.setdefault('miss_amount', 0.6)    # 故意偏离最多到「中心→边缘」距离的几成
         self.cfg.setdefault('target_score', 0)     # 目标分数：AI 自动玩到这个分数就故意失误结束（0 = 不限）
@@ -186,6 +188,7 @@ class App:
         self.v_proj = check(c, '只算沿跳跃方向的距离', 'gui_proj', self.recalc)
         self.v_live = check(c, '自动刷新画面（每 1.5 秒）', 'gui_live')
         self.v_calib = check(c, '跳完自动量落点、校准 k/b', 'auto_calib')
+        self.v_stream = check(c, '用影像串流取得画面（下次开启生效）', 'use_stream')
 
         # 学习卡
         c = card(colB, '🧠 学习')
@@ -216,6 +219,32 @@ class App:
         self.hist.tag_configure('good', foreground='#5fe08f')
         self.hist.tag_configure('bad', foreground='#ff7b66')
         self.hist.pack(fill='x')
+
+        # Servo 角度卡
+        c = card(colB, '🦾 Servo 角度（拖动时 servo 会跟着转，调好按「保存到板子」）')
+        self.ang = {}
+        for key, label, default in (('servo_rest', '静止', 0), ('servo_push', '压下', 90)):
+            self.cfg.setdefault(key, default)
+            f = tk.Frame(c, bg=CARD); f.pack(fill='x', pady=2)
+            tk.Label(f, text=label, font=FONT_B, bg=CARD, fg=TEXT, width=4, anchor='w').pack(side='left')
+            var = tk.IntVar(value=int(self.cfg[key]))
+            btn(f, '−', lambda k=key: self.nudge_angle(k, -1), font=FONT_B, width=2).pack(side='left')
+            sc = tk.Scale(f, from_=0, to=180, orient='horizontal', variable=var, showvalue=True, length=200,
+                          bg=CARD, fg=TEXT, troughcolor='#30343c', highlightthickness=0, font=FONT,
+                          command=lambda v, k=key: self.on_angle(k, int(float(v))))
+            sc.pack(side='left', fill='x', expand=True, padx=4)
+            btn(f, '＋', lambda k=key: self.nudge_angle(k, 1), font=FONT_B, width=2).pack(side='left')
+            self.ang[key] = var
+        ar = tk.Frame(c, bg=CARD); ar.pack(fill='x', pady=(6, 0))
+        for text, cmd in (('去静止位', lambda: self.live_angle(self.ang['servo_rest'].get())),
+                          ('去压下位', lambda: self.live_angle(self.ang['servo_push'].get())),
+                          ('试按 300ms', self.try_press)):
+            btn(ar, text, cmd, font=FONT).pack(side='left', padx=(0, 6))
+        btn(ar, '保存到板子', self.save_angles, bg='#3b7cff', fg='#fff', font=FONT_B).pack(side='left')
+        self.ang_lbl = tk.Label(c, text='未连接时显示的是上次保存的值', font=('Microsoft YaHei UI', 9), bg=CARD, fg=SUB)
+        self.ang_lbl.pack(anchor='w', pady=(4, 0))
+        self._live_busy = False
+        self._live_pending = None
 
         # 设定卡
         c = card(colB, '⚙ 设定')
@@ -397,7 +426,9 @@ class App:
             err = jb.check_device(self.adb)
             if not err:
                 self.awake_old = jb.keep_awake(self.adb)   # 接着 USB 时手机不休眠（暗掉时截图常卡住）
-                jb.pick_screencap_mode(self.adb)       # 测一下哪种截图方式比较快
+                self.start_stream()
+                if not (jb.STREAM and jb.STREAM.alive):
+                    jb.pick_screencap_mode(self.adb)   # 没有串流：测一下哪种截图方式比较快
             return err
         self.bg(check, self.after_check)
         self.live_tick()
@@ -406,10 +437,35 @@ class App:
         if err or err_msg:
             self.status(str(err or err_msg), 'err'); return
         self.refresh()
-        self.status(self.reset_msg or f'截图方式：{jb.SCREENCAP_INFO}', 'warn' if self.reset_msg else 'ok')
+        src = getattr(self, 'source_info', '') or f'截图（{jb.SCREENCAP_INFO}）'
+        self.status(self.reset_msg or f'画面来源：{src}', 'warn' if self.reset_msg else 'ok')
+
+    def start_stream(self):
+        """开影像串流（背景执行绪里呼叫）。失败就用原本的截图方式。"""
+        if not self.cfg.get('use_stream', True):
+            self.source_info = '截图（影像串流已关闭）'
+            return
+        st = stream.ScrcpyStream(self.adb)
+        ok, msg = st.start()
+        if ok:
+            jb.STREAM = st
+            self.source_info = msg
+        else:
+            jb.STREAM = None
+            self.source_info = f'截图（影像串流没开成：{msg}）'
+        self.store.event('stream', ok=ok, msg=msg)
+        self.stream_tried = time.time()
 
     def grab_stable(self, tries=8):
         """等画面停下来（镜头还在移动时，跳跃方向会是歪的）：连拍两张差不多才算。"""
+        st = jb.STREAM
+        if st is not None and not st.alive and time.time() - getattr(self, 'stream_tried', 0) > 30:
+            self.start_stream()                      # 串流断了：每 30 秒最多重开一次
+            st = jb.STREAM
+        if st is not None and st.alive:
+            im = st.wait_stable()                    # 连续看画面，停下来就马上拿
+            if im is not None:
+                return im
         def small(im):
             return np.asarray(im.convert('L').resize((60, 132)), dtype=np.float32)
         a = jb.screenshot(self.adb)
@@ -575,7 +631,7 @@ class App:
         if self.esp:
             return
         self.bt.config(text='搜索中…', state='disabled')
-        self.status('搜索 ESP32 中…（请先关掉手机网页上的蓝牙连接）')
+        self.status('搜索 ESP32 中…（ESP32 同时只能连一个装置，其他手机或电脑连着要先断开）')
         esp = jb.Esp(self.cfg)
         self.bg_async(esp.connect(), lambda _, err: self.after_connect(esp, err))
 
@@ -586,6 +642,69 @@ class App:
         self.esp = esp
         self.bt.config(text='🔗 已连接', bg='#1fa955', state='normal')
         self.status('已连接 ESP32 ✓', 'ok')
+        esp.on_angles = lambda r, p: self.q.put(lambda: self.got_angles(r, p))   # 蓝牙执行绪 → 介面
+        self.bg_async(esp.send('G'), lambda _, err: None)                      # 读板子上的角度
+
+    # ------------------------------------------------------------ Servo 角度
+    def got_angles(self, r, p):
+        self._setting_angles = True                  # 程式更新滑杆：不要让 servo 跟着转（不然会停在压下位）
+        try:
+            for key, v in (('servo_rest', r), ('servo_push', p)):
+                self.ang[key].set(v); self.cfg[key] = v
+            self.root.update_idletasks()
+        finally:
+            self.root.after(50, lambda: setattr(self, '_setting_angles', False))
+        jb.save_config(self.cfg)
+        self.ang_lbl.config(text=f'板子上的设定：静止 {r}°，压下 {p}°')
+
+    def on_angle(self, key, v):
+        if getattr(self, '_setting_angles', False):
+            return
+        self.cfg[key] = v
+        jb.save_config(self.cfg)
+        self.live_angle(v)
+
+    def nudge_angle(self, key, d):
+        v = max(0, min(180, self.ang[key].get() + d))
+        self.ang[key].set(v)
+        self.on_angle(key, v)
+
+    def live_angle(self, v):
+        """拖动时让 servo 跟着转（M<角度>）。蓝牙一次只能送一个，忙的时候只留最新的值。"""
+        if not self.esp:
+            return
+        if self._live_busy:
+            self._live_pending = v; return
+        self._live_busy = True
+
+        def done(_, err):
+            self._live_busy = False
+            if self._live_pending is not None:
+                n, self._live_pending = self._live_pending, None
+                self.live_angle(n)
+        self.bg_async(self.esp.send(f'M{int(v)}'), done)
+
+    def save_angles(self, then=None):
+        if not self.esp:
+            self.status('还没连接蓝牙', 'warn'); return
+        r, p = self.ang['servo_rest'].get(), self.ang['servo_push'].get()
+
+        def done(_, err):
+            if err:
+                self.status(f'保存角度失败：{err}', 'err'); return
+            self.ang_lbl.config(text=f'已保存到板子：静止 {r}°，压下 {p}°')
+            self.store.event('servo_angles', rest=r, push=p)
+            self.status(f'角度已保存到板子 ✓（静止 {r}°，压下 {p}°）。换了角度记得按「🔧 我调整了装置」', 'ok')
+            if then:
+                then()
+        self.bg_async(self.esp.send(f'A{r},{p}'), done)
+
+    def try_press(self):
+        """先存角度再试按 300ms，确保用的是现在的角度。"""
+        if not self.esp:
+            self.status('还没连接蓝牙', 'warn'); return
+        self.save_angles(then=lambda: self.bg_async(self.esp.press(300), lambda _, err: self.status(
+            '试按 300ms ✓' if not err else f'试按失败：{err}', 'ok' if not err else 'err')))
 
     def press_line(self):
         if not self.units:
@@ -986,7 +1105,12 @@ def main():
     root = tk.Tk()
     app = App(root)
 
-    def on_close():                                  # 关视窗时把手机的休眠设定还原
+    def on_close():                                  # 关视窗时把手机的休眠设定还原、关掉串流
+        try:
+            if jb.STREAM is not None:
+                jb.STREAM.stop()
+        except Exception:  # noqa: BLE001
+            pass
         if app.adb and app.awake_old is not None:
             jb.restore_awake(app.adb, app.awake_old)
         root.destroy()

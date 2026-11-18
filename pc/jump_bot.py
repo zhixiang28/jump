@@ -5,7 +5,7 @@
 流程：电脑用 adb 抓 Android 手机截图 → 自动找小人和下一个方块 → 算出按压 ms
      → 用蓝牙发 P<ms> 给 ESP32 → servo 用触控笔按。
 
-ESP32 的程序和蓝牙协议都不用改（跟网页用的是同一套）：
+ESP32 的程序和蓝牙协议都不用改：
   服务 6e400001-...，RX(写) 6e400002-...，TX(通知) 6e400003-...
   P<ms> 按压，ESP 按完回 D<ms>
 
@@ -166,9 +166,16 @@ def adb_reconnect(adb):
             pass
 
 
+STREAM = None               # stream.ScrcpyStream：影像串流开着时，截图直接拿串流的最新画面
+
+
 def screenshot(adb, tries=3):
-    """截图。手机偶尔会卡住：每次最多等 SHOT_TIMEOUT 秒，失败就换另一种方式再试；
+    """截图。影像串流开着就直接用串流的最新画面（不会卡住）；否则用 screencap。手机偶尔会卡住：每次最多等 SHOT_TIMEOUT 秒，失败就换另一种方式再试；
     第二次失败时让 adb 重新连线。全部失败才丢出错误。"""
+    if STREAM is not None and STREAM.alive:
+        im = STREAM.latest()
+        if im is not None:
+            return im
     order = [SCREENCAP_MODE, 'png' if SCREENCAP_MODE == 'raw' else 'raw']
     last = None
     for i in range(tries):
@@ -328,11 +335,12 @@ class Esp:
         self.cfg = cfg
         self.client = None
         self.done = asyncio.Event()
+        self.on_angles = None          # 收到 ESP 回报角度（A<静止>,<压下>）时呼叫 on_angles(静止, 压下)
 
     async def connect(self):
         from bleak import BleakClient, BleakScanner
         name = (self.cfg.get('ble_name') or '').strip()
-        print('搜索 ESP32 蓝牙中…（请先关掉手机网页上的蓝牙连接）')
+        print('搜索 ESP32 蓝牙中…（ESP32 同时只能连一个装置）')
 
         def match(d, ad):
             if name and (d.name or '') == name:
@@ -350,6 +358,12 @@ class Esp:
             msg = bytes(data).decode(errors='ignore')
             if msg.startswith('D'):
                 loop.call_soon_threadsafe(self.done.set)
+            elif msg.startswith('A') and self.on_angles:
+                try:
+                    r, p = (int(float(v)) for v in msg[1:].split(','))
+                    self.on_angles(r, p)
+                except ValueError:
+                    pass
 
         await self.client.start_notify(TX, on_notify)
         print(f'已连接 {dev.name or dev.address}')
@@ -361,6 +375,10 @@ class Esp:
             await asyncio.wait_for(self.done.wait(), timeout=ms / 1000 + 3)
         except asyncio.TimeoutError:
             pass
+
+    async def send(self, cmd):
+        """直接送一个指令（M<角度> 即时转动、A<静止>,<压下> 存角度、G 读角度）。"""
+        await self.client.write_gatt_char(RX, cmd.encode(), response=True)
 
     async def close(self):
         if self.client:
