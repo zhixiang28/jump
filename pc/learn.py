@@ -344,12 +344,11 @@ def _dilate(m):
     return d
 
 
-def find_face(img, fx, fy, angle_deg, Wn):
-    """用顶面的奶油色找目标：几乎每个方块的顶面都是同一种奶油色 (≈250,237,205)。
-    沿跳跃线往外走，第一块「不是脚下那块」的奶油色顶面，它的中心就是目标中心。"""
+def find_face(img, fx, fy, angle_deg, Wn, kind='cream'):
+    """用顶面的颜色找目标：几乎每个方块的顶面都是同一种奶油色 (≈250,237,205)；金币的顶面是金色。
+    沿跳跃线往外走，第一块「不是脚下那块」的顶面，它的中心就是目标中心。"""
     Hn = img.shape[0]
-    r, g, b = img[..., 0], img[..., 1], img[..., 2]
-    cream = (r > 225) & (g > 205) & (b > 165) & (r - b > 18) & (r - b < 80) & (r - g > 3) & (r - g < 30)
+    cream = face_mask(img, kind)
     cream[:int(0.25 * Hn)] = False                               # 上面是分数、雪山
     cream[int(fy + 0.08 * Wn):] = False                          # 脚下以下是之前的方块
     lab, sizes = _label(_dilate(cream))                          # 稍微膨胀，把顶面上细线分开的部分接起来
@@ -365,7 +364,10 @@ def find_face(img, fx, fy, angle_deg, Wn):
         if L not in shape_ok:
             ys, xs = np.nonzero(lab == L)
             w, h = xs.max() - xs.min() + 1, ys.max() - ys.min() + 1
-            shape_ok[L] = h / w >= 0.38 and w >= 0.12 * Wn
+            if kind == 'gold':                                   # 金币顶面：大的椭圆（窗户、灯笼、装饰都比较小）
+                shape_ok[L] = _coin_shape(lab == L, Wn)
+            else:
+                shape_ok[L] = h / w >= 0.38 and w >= 0.12 * Wn
         return shape_ok[L]
 
     found = []
@@ -393,7 +395,8 @@ def find_face(img, fx, fy, angle_deg, Wn):
     s, side, L = min(found)
     ys, xs = np.nonzero((lab == L) & cream)
     w = float(xs.max() - xs.min() + 1)
-    if (ys.max() - ys.min() + 1) / w > 0.7:
+    if kind == 'gold' or (ys.max() - ys.min() + 1) / w > 0.7:
+        # 金币的侧面上半部也是亮金色，重心会偏下；
         # 比正常顶面（高÷宽 ≈ 0.5）高很多：连到了同颜色的墙壁 → 用左右端点算中心
         cx, cy = map(float, face_center_extremes(ys, xs))
     else:
@@ -401,7 +404,7 @@ def find_face(img, fx, fy, angle_deg, Wn):
     if w < 0.12 * Wn or (cx - fx) * side <= 0 or cy >= fy:
         return None
     return {'center': (cx / Wn, cy / Wn), 'top': (cx / Wn, ys.min() / Wn), 'side': side, 'width': w / Wn,
-            'method': 'face'}
+            'method': 'face' if kind == 'cream' else 'gold'}
 
 
 def face_center_extremes(ys, xs):
@@ -418,29 +421,52 @@ def cream_mask(img):
     return (r > 225) & (g > 205) & (b > 165) & (r - b > 18) & (r - b < 80) & (r - g > 3) & (r - g < 30)
 
 
+def gold_mask(img):
+    """金币的顶面（亮金色 ≈ 250,200~240,70~140）；金币侧面比较暗（绿色值 < 175），不算。"""
+    r, g, b = img[..., 0].astype(np.int16), img[..., 1].astype(np.int16), img[..., 2].astype(np.int16)
+    return (r > 232) & (g > 178) & (g < 246) & (b < 165) & (r - b > 90) & (r - g > 6)
+
+
+def _coin_shape(m, Wn):
+    ys, xs = np.nonzero(m)
+    if not len(xs):
+        return False
+    w, h = xs.max() - xs.min() + 1, ys.max() - ys.min() + 1
+    return 0.4 <= h / w <= 0.75 and w >= 0.2 * Wn and len(xs) >= 0.3 * w * h
+
+
+def face_mask(img, kind='cream'):
+    return gold_mask(img) if kind == 'gold' else cream_mask(img)
+
+
 def standing_face(im, foot, expect_width=None):
     """小人现在站的那块顶面的中心（屏宽比例）。
     - 只取「脚底下」那块顶面：在脚的周围一圈找奶油色，旁边别的方块（例如后面的炸鸡盘）不会混进来。
-      金币那种顶面不是奶油色的：脚下找不到就回传 None（不量，比量错好）。
+      找不到奶油色就找金色（金币）；都找不到就回传 None（不量，比量错好）。
     - 小人会挡住顶面中间，所以用顶面最左、最右两点（菱形 / 椭圆的左右端点都在中心高度）。
     - 顶面被萤幕边缘切掉一半时：用看得到的那一边 + 跳之前量到的顶面宽度（expect_width）推算中心。"""
     Wn = NW // 2
     img = as_arr(im, Wn)
     fx, fy = foot[0] * Wn, foot[1] * Wn
-    cream = cream_mask(img)
-    lab, sizes = _label(_dilate(cream))
-    H = lab.shape[0]
-    hits = {}
-    for ang in np.linspace(-0.15 * np.pi, 1.15 * np.pi, 24):       # 脚的左、右、前方一圈（后面被身体挡住）
-        for rad in (0.035, 0.05, 0.065):
-            x = int(round(fx + np.cos(ang) * rad * Wn))
-            y = int(round(fy + np.sin(ang) * rad * Wn * 0.55))
-            if 0 <= x < Wn and 0 <= y < H and lab[y, x]:
-                L = int(lab[y, x])
-                hits[L] = hits.get(L, 0) + 1
-    labs = [L for L, n in hits.items() if n >= 3 and sizes[L] >= 0.001 * Wn * Wn]
+    H = img.shape[0]
+    for kind in ('cream', 'gold'):                     # 先找奶油色顶面，没有再找金币的金色顶面
+        cream = face_mask(img, kind)
+        lab, sizes = _label(_dilate(cream))
+        hits = {}
+        for ang in np.linspace(-0.15 * np.pi, 1.15 * np.pi, 24):   # 脚的左、右、前方一圈（后面被身体挡住）
+            for rad in (0.035, 0.05, 0.065):
+                x = int(round(fx + np.cos(ang) * rad * Wn))
+                y = int(round(fy + np.sin(ang) * rad * Wn * 0.55))
+                if 0 <= x < Wn and 0 <= y < H and lab[y, x]:
+                    L = int(lab[y, x])
+                    hits[L] = hits.get(L, 0) + 1
+        labs = [L for L, n in hits.items() if n >= 3 and sizes[L] >= 0.001 * Wn * Wn]
+        if kind == 'gold':
+            labs = [L for L in labs if _coin_shape(lab == L, Wn)]   # 盘子边、装饰也有金色：要像金币的大椭圆才算
+        if labs:
+            break
     if not labs:
-        return None                                    # 脚下没有奶油色顶面（例如金币）
+        return None                                    # 脚下找不到顶面
     m = np.isin(lab, labs) & cream
     ys, xs = np.nonzero(m)
     keep = np.abs(xs - fx) <= 0.30 * Wn                # 保险：离脚太远的不算
@@ -497,7 +523,7 @@ def find_target(im, foot, angle_deg=30, diff_thr=45):
     img = as_arr(im, Wn)
     Hn = img.shape[0]
     fx, fy = foot[0] * Wn, foot[1] * Wn
-    face = find_face(img, fx, fy, angle_deg, Wn)
+    face = find_face(img, fx, fy, angle_deg, Wn) or find_face(img, fx, fy, angle_deg, Wn, 'gold')   # 没有奶油色顶面 → 金币
     if face:
         return face
     y0 = int(0.18 * Hn)
