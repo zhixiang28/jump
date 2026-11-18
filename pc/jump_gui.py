@@ -77,11 +77,20 @@ class App:
         self.cfg.setdefault('miss_amount', 0.6)    # 故意偏离最多到「中心→边缘」距离的几成
         self.cfg.setdefault('target_score', 0)     # 目标分数：AI 自动玩到这个分数就故意失误结束（0 = 不限）
         self.reset_msg = ''
-        if not learn.sane_calibration(self.cfg):   # 例如之前学坏的 k = 0.30、b = 524
-            self.reset_msg = (f'⚠ 之前的 k = {self.cfg.get("k")}、b = {self.cfg.get("b")} 不合理（学坏了），'
-                              f'已重设为 k = {learn.K_DEFAULT}、b = {learn.B_DEFAULT}，会重新校准')
-            self.cfg.update(k=learn.K_DEFAULT, b=learn.B_DEFAULT, k_side=0, k_foot=0, calib_since=time.time())
-            jb.save_config(self.cfg)
+        self.cfg['k_foot'] = 0                     # 「小人高度修正」已经拿掉（不稳定）
+        if not learn.sane_calibration(self.cfg):   # 例如之前学坏的 k = 0.30、b = 524，或 k = 1.70、b = −50
+            old = (self.cfg.get('k'), self.cfg.get('b'))
+            f = learn.fit_land(self.store, cfg=dict(self.cfg, calib_since=0))   # 先试着用以前量到的落点重算
+            if f and learn.sane_calibration(f):
+                self.cfg.update(k=round(f['k'], 4), b=round(f['b']), k_side=round(f['k_side'], 1),
+                                k_small=round(f.get('k_small', 0), 1), foot0=f['foot0'])
+                how = f'用之前 {f["n"]} 跳的落点重算'
+            else:
+                self.cfg.update(k=learn.K_DEFAULT, b=learn.B_DEFAULT, k_side=0, k_small=0, calib_since=time.time())
+                how = '重设为预设值，会重新校准'
+            self.reset_msg = (f'⚠ 之前的 k = {old[0]}、b = {old[1]} 不合理（学坏了），{how}：'
+                              f'k = {self.cfg["k"]}、b = {self.cfg["b"]}')
+        jb.save_config(self.cfg)
         self.build()
         self.root.after(50, self.poll)
         self.root.after(100, self.start)

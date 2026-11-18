@@ -787,7 +787,7 @@ def _robust_lstsq(X, y, min_keep):
     return w, keep
 
 
-K_RANGE, B_RANGE = (0.6, 2.0), (-50.0, 450.0)     # k、b 的合理范围
+K_RANGE, B_RANGE = (0.6, 2.0), (0.0, 450.0)       # k、b 的合理范围（b = servo 下压的时间，不会是负的）
 K_DEFAULT, B_DEFAULT = 1.0, 200                     # 设定不合理时重设的值（之前几次资料大约 k≈1.0、b≈50~270）
 
 
@@ -840,8 +840,7 @@ def fit_land(store, n=80, cfg=None):
     cols = {'base': [ms, np.ones_like(ms)]}
     if len(rs) >= 30 and (side > 0).sum() >= 8 and (side < 0).sum() >= 8:
         cols['side'] = cols['base'] + [side]
-        if len(rs) >= 40:
-            cols['side+foot'] = cols['side'] + [fy - f0]
+    # （以前还有「小人高度修正」：最后一次资料里系数在 -1100 ~ +780 之间乱跳，跟距离太相关，已拿掉）
     if len(rs) >= 30 and small.sum() >= 6:               # 有够多「从小平台起跳」的资料
         cols['small'] = cols['base'] + [small]
         if 'side' in cols:
@@ -861,7 +860,7 @@ def fit_land(store, n=80, cfg=None):
         return float(np.sqrt((e ** 2).mean()))
 
     best, best_cv = 'base', cv_rms(cols['base'])
-    for name in ('side', 'small', 'side+small', 'side+foot'):
+    for name in ('side', 'small', 'side+small'):
         if name in cols:
             cv = cv_rms(cols[name])
             if cv < best_cv * 0.95:                      # 至少准 5% 才值得多学一项
@@ -872,11 +871,26 @@ def fit_land(store, n=80, cfg=None):
         return None
     a, c = float(w[0]), float(w[1])
     k, b = 1.0 / a, -c / a
-    names = {'base': [], 'side': ['side'], 'small': ['small'], 'side+small': ['side', 'small'],
-             'side+foot': ['side', 'foot']}[best]
+    names = {'base': [], 'side': ['side'], 'small': ['small'], 'side+small': ['side', 'small']}[best]
     coef = {n: -float(w[2 + j]) / a for j, n in enumerate(names)}
+    if not (B_RANGE[0] <= b <= B_RANGE[1]):
+        # b 超出合理范围：不能只把 b 夹住、k 却用拟合的（两个数字会对不上，按压时间整个偏掉）。
+        # 改成 b 固定在边界，重新只估 k（左右 / 小平台修正照样扣掉）。
+        b = float(min(B_RANGE[1], max(B_RANGE[0], b)))
+        u = ms - b - coef.get('side', 0.0) * side - coef.get('small', 0.0) * small
+        kk = np.ones(len(t), bool)
+        for _ in range(2):
+            a2 = float((u[kk] * t[kk]).sum() / max(1e-6, (u[kk] ** 2).sum()))
+            res = np.abs(a2 * u - t)
+            kk = res <= max(3 * np.median(res[kk]), 15)
+        if a2 <= 0:
+            return None
+        k = 1.0 / a2
+        rms_t = float(np.sqrt(((a2 * u[kk] - t[kk]) ** 2).mean()))
+        return {'k': k, 'b': b, 'k_side': coef.get('side', 0.0), 'k_foot': 0.0, 'k_small': coef.get('small', 0.0),
+                'foot0': f0, 'terms': best + '(b 到边界)', 'rms': rms_t * k, 'cv': best_cv * k, 'n': int(kk.sum())}
     rms_t = float(np.sqrt(((X[keep] @ w - t[keep]) ** 2).mean()))
-    return {'k': k, 'b': b, 'k_side': coef.get('side', 0.0), 'k_foot': coef.get('foot', 0.0),
+    return {'k': k, 'b': b, 'k_side': coef.get('side', 0.0), 'k_foot': 0.0,
             'k_small': coef.get('small', 0.0), 'foot0': f0, 'terms': best,
             'rms': rms_t * k, 'cv': best_cv * k, 'n': int(keep.sum())}
 
@@ -888,8 +902,11 @@ def calibration_update(store, cfg, rec):
     if f and f['rms'] < (60 if fresh else 30):           # 刚重新校准时资料比较乱，也先用（下面有每次变动上限）
         new = {'k': f['k'], 'b': f['b'], 'k_side': f['k_side'], 'k_foot': f['k_foot'], 'foot0': f['foot0'],
                'k_small': f.get('k_small', 0.0)}
-        terms = {'base': '', 'side': ' + 左右修正', 'side+foot': ' + 左右修正 + 高度修正', 'small': ' + 小平台修正',
-                 'side+small': ' + 左右修正 + 小平台修正', 'k-only': '（只调 k）'}[f['terms']]
+        base_terms = f['terms'].replace('(b 到边界)', '')
+        terms = {'base': '', 'side': ' + 左右修正', 'small': ' + 小平台修正',
+                 'side+small': ' + 左右修正 + 小平台修正', 'k-only': '（只调 k）'}[base_terms]
+        if '(b 到边界)' in f['terms']:
+            terms += '（b 到边界，只调 k）'
         how = f'（{f["n"]} 跳拟合{terms}，误差 ±{f["rms"]:.0f} ms）'
     else:
         traveled = rec['land']['traveled']
@@ -909,12 +926,12 @@ def calibration_update(store, cfg, rec):
             new = {'k': cfg['k'] + 0.6 * (k_true - cfg['k'])}
             how = '（单跳修正）'
     # 合理范围 + 每次最多变多少（避免一次量错或资料太少就大幅偏掉）
-    step = 0.35 if fresh else 0.15
+    step = 0.35 if fresh else 0.05                      # 平常每次 k 最多变 5%（以前 15%，连续几次就失控）
     k_old = cfg['k']
     new['k'] = float(min(K_RANGE[1], max(K_RANGE[0], min(k_old * (1 + step), max(k_old * (1 - step), new['k'])))))
     if 'b' in new:
         b_old = cfg['b']
-        db = 120 if fresh else 40
+        db = 120 if fresh else 20
         new['b'] = float(min(B_RANGE[1], max(B_RANGE[0], min(b_old + db, max(b_old - db, new['b'])))))
     new = {key: (round(v, 4) if key in ('k', 'foot0') else round(v, 1) if key in ('k_side', 'k_foot', 'k_small') else round(v))
            for key, v in new.items()}
