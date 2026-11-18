@@ -32,6 +32,7 @@ EXPORT = os.path.join(HERE, 'export')
 
 NW = 540            # 学习 / 比对用的截图宽度
 MAX_RECS = 300
+KEEP_MANUAL = 60    # 你自己画的纪录（小人模板、目标记忆的来源）最多保留几笔，不会被 AI 的纪录挤掉
 # 小人模板（屏宽比例）：只切小人的身体（帽子、头、围巾），不要脚下的方块和两边的背景，
 # 否则小人站到不同颜色的方块上就认不出来。起点常常点在脚前面一点，所以底部离起点留一段。
 TPL_W, TPL_TOP, TPL_BOTTOM = 0.14, 0.30, 0.07
@@ -40,6 +41,15 @@ GOOD_ERR = 0.03     # 中位误差 ≤ 3% 算够准
 
 
 # ================================================================ 纪录
+def _json_default(o):
+    """numpy 的数字 / 布林值（例如 np.bool_）json 不认得：换成一般的 Python 值。"""
+    if isinstance(o, np.generic):
+        return o.item()
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+    return str(o)
+
+
 class Store:
     def __init__(self):
         os.makedirs(SHOTS, exist_ok=True)
@@ -55,7 +65,7 @@ class Store:
     def save(self):
         tmp = LOG + '.tmp'
         with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(self.recs, f, ensure_ascii=False)
+            json.dump(self.recs, f, ensure_ascii=False, default=_json_default)
         os.replace(tmp, LOG)
 
     def add(self, im, a, b, units, ms, pred=None, auto=False, extra=None):
@@ -78,7 +88,13 @@ class Store:
             rec.update({k: v for k, v in extra.items() if k not in rec})   # 不覆盖原本的栏位
         self.recs.append(rec)
         while len(self.recs) > MAX_RECS:
-            old = self.recs.pop(0)
+            # 先丢最旧的 AI 纪录；你画的纪录是小人模板的来源，保留最近 KEEP_MANUAL 笔
+            # （以前 AI 连玩 300 跳后你画的全被挤掉，下次开程式就认不出小人）
+            manual = sum(1 for r in self.recs if not r.get('auto'))
+            idx = 0
+            if manual <= KEEP_MANUAL:
+                idx = next((i for i, r in enumerate(self.recs) if r.get('auto')), 0)
+            old = self.recs.pop(idx)
             for suffix in ('.jpg', '_after.jpg'):
                 try:
                     os.remove(os.path.join(SHOTS, old['id'] + suffix))
@@ -109,9 +125,9 @@ class Store:
                     w.writerow(['time', 'clock', 'event', 'detail'])
                 t = time.time()
                 w.writerow([f'{t:.3f}', time.strftime('%H:%M:%S', time.localtime(t)) + f'.{int(t * 1000) % 1000:03d}',
-                            kind, json.dumps(kv, ensure_ascii=False)])
-        except Exception:  # noqa: BLE001
-            pass
+                            kind, json.dumps(kv, ensure_ascii=False, default=_json_default)])
+        except Exception as e:  # noqa: BLE001
+            print('操作纪录写不了：', kind, e)
 
     def set_result(self, rec, r, est):
         if rec is None:
@@ -185,9 +201,11 @@ def build_templates(store, max_n=12, scan=60):
     小人会转向（背面、侧面…），所以尽量收集不同姿势：跟已经有的样板几乎一样的就跳过。"""
     tpls = []
     tw, th = round(TPL_W * NW), round((TPL_TOP - TPL_BOTTOM) * NW)
+    # 只信你自己画的起点，避免越学越歪。一笔都没有（例如旧版把它们挤掉了）才退而用 AI 很有把握的那几跳
+    use_auto = not any(not r.get('auto') for r in store.recs)
     for rec in reversed(store.recs):
-        if rec.get('auto'):
-            continue                       # 只信你自己画的起点，避免越学越歪
+        if rec.get('auto') and not (use_auto and ((rec.get('pred') or {}).get('score') or 0) >= 0.95):
+            continue
         try:
             img = as_arr(store.shot(rec), NW)
         except Exception:  # noqa: BLE001
@@ -344,12 +362,11 @@ def _dilate(m):
     return d
 
 
-def find_face(img, fx, fy, angle_deg, Wn):
-    """用顶面的奶油色找目标：几乎每个方块的顶面都是同一种奶油色 (≈250,237,205)。
-    沿跳跃线往外走，第一块「不是脚下那块」的奶油色顶面，它的中心就是目标中心。"""
+def find_face(img, fx, fy, angle_deg, Wn, kind='cream'):
+    """用顶面的颜色找目标：几乎每个方块的顶面都是同一种奶油色 (≈250,237,205)；金币的顶面是金色。
+    沿跳跃线往外走，第一块「不是脚下那块」的顶面，它的中心就是目标中心。"""
     Hn = img.shape[0]
-    r, g, b = img[..., 0], img[..., 1], img[..., 2]
-    cream = (r > 225) & (g > 205) & (b > 165) & (r - b > 18) & (r - b < 80) & (r - g > 3) & (r - g < 30)
+    cream = face_mask(img, kind)
     cream[:int(0.25 * Hn)] = False                               # 上面是分数、雪山
     cream[int(fy + 0.08 * Wn):] = False                          # 脚下以下是之前的方块
     lab, sizes = _label(_dilate(cream))                          # 稍微膨胀，把顶面上细线分开的部分接起来
@@ -365,7 +382,10 @@ def find_face(img, fx, fy, angle_deg, Wn):
         if L not in shape_ok:
             ys, xs = np.nonzero(lab == L)
             w, h = xs.max() - xs.min() + 1, ys.max() - ys.min() + 1
-            shape_ok[L] = h / w >= 0.38 and w >= 0.12 * Wn
+            if kind == 'gold':                                   # 金币顶面：大的椭圆（窗户、灯笼、装饰都比较小）
+                shape_ok[L] = _coin_shape(lab == L, Wn)
+            else:
+                shape_ok[L] = h / w >= 0.38 and w >= 0.12 * Wn
         return shape_ok[L]
 
     found = []
@@ -393,7 +413,8 @@ def find_face(img, fx, fy, angle_deg, Wn):
     s, side, L = min(found)
     ys, xs = np.nonzero((lab == L) & cream)
     w = float(xs.max() - xs.min() + 1)
-    if (ys.max() - ys.min() + 1) / w > 0.7:
+    if kind == 'gold' or (ys.max() - ys.min() + 1) / w > 0.7:
+        # 金币的侧面上半部也是亮金色，重心会偏下；
         # 比正常顶面（高÷宽 ≈ 0.5）高很多：连到了同颜色的墙壁 → 用左右端点算中心
         cx, cy = map(float, face_center_extremes(ys, xs))
     else:
@@ -401,7 +422,7 @@ def find_face(img, fx, fy, angle_deg, Wn):
     if w < 0.12 * Wn or (cx - fx) * side <= 0 or cy >= fy:
         return None
     return {'center': (cx / Wn, cy / Wn), 'top': (cx / Wn, ys.min() / Wn), 'side': side, 'width': w / Wn,
-            'method': 'face'}
+            'method': 'face' if kind == 'cream' else 'gold'}
 
 
 def face_center_extremes(ys, xs):
@@ -418,29 +439,52 @@ def cream_mask(img):
     return (r > 225) & (g > 205) & (b > 165) & (r - b > 18) & (r - b < 80) & (r - g > 3) & (r - g < 30)
 
 
+def gold_mask(img):
+    """金币的顶面（亮金色 ≈ 250,200~240,70~140）；金币侧面比较暗（绿色值 < 175），不算。"""
+    r, g, b = img[..., 0].astype(np.int16), img[..., 1].astype(np.int16), img[..., 2].astype(np.int16)
+    return (r > 232) & (g > 178) & (g < 246) & (b < 165) & (r - b > 90) & (r - g > 6)
+
+
+def _coin_shape(m, Wn):
+    ys, xs = np.nonzero(m)
+    if not len(xs):
+        return False
+    w, h = xs.max() - xs.min() + 1, ys.max() - ys.min() + 1
+    return 0.4 <= h / w <= 0.75 and w >= 0.2 * Wn and len(xs) >= 0.3 * w * h
+
+
+def face_mask(img, kind='cream'):
+    return gold_mask(img) if kind == 'gold' else cream_mask(img)
+
+
 def standing_face(im, foot, expect_width=None):
     """小人现在站的那块顶面的中心（屏宽比例）。
     - 只取「脚底下」那块顶面：在脚的周围一圈找奶油色，旁边别的方块（例如后面的炸鸡盘）不会混进来。
-      金币那种顶面不是奶油色的：脚下找不到就回传 None（不量，比量错好）。
+      找不到奶油色就找金色（金币）；都找不到就回传 None（不量，比量错好）。
     - 小人会挡住顶面中间，所以用顶面最左、最右两点（菱形 / 椭圆的左右端点都在中心高度）。
     - 顶面被萤幕边缘切掉一半时：用看得到的那一边 + 跳之前量到的顶面宽度（expect_width）推算中心。"""
     Wn = NW // 2
     img = as_arr(im, Wn)
     fx, fy = foot[0] * Wn, foot[1] * Wn
-    cream = cream_mask(img)
-    lab, sizes = _label(_dilate(cream))
-    H = lab.shape[0]
-    hits = {}
-    for ang in np.linspace(-0.15 * np.pi, 1.15 * np.pi, 24):       # 脚的左、右、前方一圈（后面被身体挡住）
-        for rad in (0.035, 0.05, 0.065):
-            x = int(round(fx + np.cos(ang) * rad * Wn))
-            y = int(round(fy + np.sin(ang) * rad * Wn * 0.55))
-            if 0 <= x < Wn and 0 <= y < H and lab[y, x]:
-                L = int(lab[y, x])
-                hits[L] = hits.get(L, 0) + 1
-    labs = [L for L, n in hits.items() if n >= 3 and sizes[L] >= 0.001 * Wn * Wn]
+    H = img.shape[0]
+    for kind in ('cream', 'gold'):                     # 先找奶油色顶面，没有再找金币的金色顶面
+        cream = face_mask(img, kind)
+        lab, sizes = _label(_dilate(cream))
+        hits = {}
+        for ang in np.linspace(-0.15 * np.pi, 1.15 * np.pi, 24):   # 脚的左、右、前方一圈（后面被身体挡住）
+            for rad in (0.035, 0.05, 0.065):
+                x = int(round(fx + np.cos(ang) * rad * Wn))
+                y = int(round(fy + np.sin(ang) * rad * Wn * 0.55))
+                if 0 <= x < Wn and 0 <= y < H and lab[y, x]:
+                    L = int(lab[y, x])
+                    hits[L] = hits.get(L, 0) + 1
+        labs = [L for L, n in hits.items() if n >= 3 and sizes[L] >= 0.001 * Wn * Wn]
+        if kind == 'gold':
+            labs = [L for L in labs if _coin_shape(lab == L, Wn)]   # 盘子边、装饰也有金色：要像金币的大椭圆才算
+        if labs:
+            break
     if not labs:
-        return None                                    # 脚下没有奶油色顶面（例如金币）
+        return None                                    # 脚下找不到顶面
     m = np.isin(lab, labs) & cream
     ys, xs = np.nonzero(m)
     keep = np.abs(xs - fx) <= 0.30 * Wn                # 保险：离脚太远的不算
@@ -497,7 +541,7 @@ def find_target(im, foot, angle_deg=30, diff_thr=45):
     img = as_arr(im, Wn)
     Hn = img.shape[0]
     fx, fy = foot[0] * Wn, foot[1] * Wn
-    face = find_face(img, fx, fy, angle_deg, Wn)
+    face = find_face(img, fx, fy, angle_deg, Wn) or find_face(img, fx, fy, angle_deg, Wn, 'gold')   # 没有奶油色顶面 → 金币
     if face:
         return face
     y0 = int(0.18 * Hn)
@@ -767,8 +811,10 @@ SMALL_FACE = 0.22    # 顶面宽度小于屏宽的 22% = 小平台（通常也�
 
 
 def ms_for(units, side, foot_y, cfg, cur_width=None):
-    """按压时间 = k × 距离 + b（+ 左右方向修正 + 小人高度修正 + 从小平台起跳的修正，自动校准学到才有）。"""
+    """按压时间 = k × 距离 + b（+ 左右方向修正 + 小人高度修正 + 从小平台起跳的修正，自动校准学到才有）。
+    x_shift：瞄准点往右挪多少（屏宽 = 1000），由游戏的 Perfect 判定学来（见 x_shift_update）。"""
     small = 1.0 if (cur_width and cur_width < SMALL_FACE) else 0.0
+    units = units + cfg.get('x_shift', 0) * side * math.cos(math.radians(cfg.get('jump_angle_deg', 30)))
     ms = (units * cfg['k'] + cfg['b'] + cfg.get('k_side', 0) * side
           + cfg.get('k_foot', 0) * (foot_y - cfg.get('foot0', foot_y)) + cfg.get('k_small', 0) * small)
     return int(round(max(cfg.get('min_ms', 150), min(cfg.get('max_ms', 2500), ms))))
@@ -938,6 +984,49 @@ def calibration_update(store, cfg, rec):
     return new, how
 
 
+# ================================================================ 用游戏的 Perfect 判定修正瞄准
+# 量落点（小人脚的位置、顶面中心）有几个像素的左右偏差，自动校准看不出来（它只看量到的结果）。
+# 但游戏自己的判定看得出来：没拿到 Perfect 的那几跳，偏的方向应该左右各半；
+# 如果「往左跳都跳过头、往右跳都不够远」（= 落点都偏左），就是瞄准点整个偏了 → 往右挪一点，反之亦然。
+# 大平台容许误差大看不出来，小平台（容许误差小）就会常常没拿到 Perfect。
+X_SHIFT_STEP = 3.0      # 每次没拿到 Perfect 挪多少（屏宽 = 1000）
+X_SHIFT_MAX = 40.0
+
+
+def _miss_x(rec):
+    """这跳没拿到 Perfect 时，落点偏左（-1）还是偏右（+1）；不算的回传 0。"""
+    land, gain = rec.get('land') or {}, rec.get('score_gain')
+    if gain is None or not (1 <= gain <= 4) or rec.get('aim') or rec.get('end_game'):
+        return 0                                   # 拿到 Perfect / 没分数 / 故意偏离的不算
+    err = land.get('err')
+    if err is None or land.get('perfect_fix') or abs(err) < 10:
+        return 0
+    side = _jump_side(rec)
+    return 1 if err * side > 0 else -1             # 往右跳跳过头 / 往左跳不够远 = 偏右
+
+
+def x_shift_update(cfg, rec):
+    """跳完、知道有没有 Perfect 之后呼叫。回传新的 x_shift，或 None（不用改）。"""
+    mx = _miss_x(rec)
+    if not mx:
+        return None
+    new = float(cfg.get('x_shift', 0)) - mx * X_SHIFT_STEP
+    return round(max(-X_SHIFT_MAX, min(X_SHIFT_MAX, new)), 1)
+
+
+def x_shift_initial(store):
+    """第一次用：从以前 Perfect 的那几跳估一个起始值（量到的脚 - 顶面中心，左右方向的中位数）。"""
+    xs = []
+    for r in store.recs[-150:]:
+        land = r.get('land') or {}
+        if (r.get('score_gain') or 0) >= 5 and not r.get('aim') and land.get('foot') and land.get('face') \
+                and not land.get('perfect_fix'):
+            xs.append((land['foot'][0] - land['face'][0]) * 1000)
+    if len(xs) < 10:
+        return 0.0
+    return round(max(-X_SHIFT_MAX, min(X_SHIFT_MAX, float(np.median(xs)))), 1)
+
+
 def bias_alarm(store, cfg, n=5, thr=0.05):
     """最近 n 跳的落点都往同一边偏超过 thr：装置可能变了（例如换了按压角度）。
     触发后要再累积 10 跳以上才会再触发（不然会一直清掉资料、永远学不起来）。"""
@@ -1011,6 +1100,7 @@ def export(store, cfg, extra_info=None):
         f'纪录：{len(recs)} 跳（你画的 {sum(1 for r in recs if not r.get("auto"))}，AI {sum(1 for r in recs if r.get("auto"))}）',
         f'量到落点：{lc} 跳' + (f'，最近 {ls["n"]} 跳平均偏 {ls["mean"] * 100:.2f}%' if ls else ''),
         f'AI vs 你：' + (f'最近 {sh["n"]} 跳中位误差 {sh["med"] * 100:.2f}%' if sh.get('n') else '没有资料'),
+        f'瞄准左右修正（x_shift）：{cfg.get("x_shift", 0)}',
         f'目前 k = {cfg.get("k")}, b = {cfg.get("b")}, 跳跃角度 {cfg.get("jump_angle_deg")}°, 投影 {cfg.get("gui_proj")}',
         '落点拟合：' + (f'k = {fl["k"]:.4f}, b = {fl["b"]:.1f}, 左右修正 {fl["k_side"]:+.1f} ms, 高度修正 {fl["k_foot"]:+.1f}'
                        f'（{fl["terms"]}，{fl["n"]} 跳，±{fl["rms"]:.1f} ms，另一半资料测 ±{fl["cv"]:.1f} ms）' if fl else '资料不够'),
@@ -1021,8 +1111,8 @@ def export(store, cfg, extra_info=None):
 
     with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:
         z.writestr('summary.txt', '\n'.join(summary))
-        z.writestr('jump_config.json', json.dumps(cfg, ensure_ascii=False, indent=2))
-        z.writestr('log.json', json.dumps(recs, ensure_ascii=False, indent=1))
+        z.writestr('jump_config.json', json.dumps(cfg, ensure_ascii=False, indent=2, default=_json_default))
+        z.writestr('log.json', json.dumps(recs, ensure_ascii=False, indent=1, default=_json_default))
         buf = __import__('io').StringIO()
         csv.writer(buf).writerows(rows)
         z.writestr('jumps.csv', '\ufeff' + buf.getvalue())

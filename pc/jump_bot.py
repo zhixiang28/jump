@@ -81,14 +81,23 @@ def load_config():
     except FileNotFoundError:
         save_config(cfg)
     except Exception as e:
-        print('设定档读取失败，用预设值：', e)
+        # 坏掉的设定档先改名留着（里面有校准好的 k、b），不要被预设值直接盖掉
+        bad = CONFIG_PATH.replace('.json', '.broken.json')
+        try:
+            os.replace(CONFIG_PATH, bad)
+        except OSError:
+            bad = ''
+        print('设定档读取失败，用预设值：', e, f'（原档改名为 {bad}）' if bad else '')
     return cfg
 
 
 def save_config(cfg):
+    """先写到暂存档再换掉原档：写到一半当机 / 断电，原本的设定档也不会坏掉。"""
+    tmp = CONFIG_PATH + '.tmp'
     try:
-        with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+        with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, CONFIG_PATH)
     except Exception as e:
         print('设定档存不了：', e)
 
@@ -336,6 +345,8 @@ class Esp:
         self.client = None
         self.done = asyncio.Event()
         self.on_angles = None          # 收到 ESP 回报角度（A<静止>,<压下>）时呼叫 on_angles(静止, 压下)
+        self.on_lost = None            # 蓝牙意外断开时呼叫 on_lost()（自己呼叫 close() 断开的不算）
+        self.closing = False
 
     async def connect(self):
         from bleak import BleakClient, BleakScanner
@@ -350,7 +361,13 @@ class Esp:
         dev = await BleakScanner.find_device_by_filter(match, timeout=15)
         if not dev:
             raise RuntimeError('找不到 ESP32：确认它有通电，而且没有被别的装置连着')
-        self.client = BleakClient(dev, disconnected_callback=lambda c: print('\n⚠ 蓝牙断开'))
+        def lost(_):
+            if self.closing:
+                return
+            print('\n⚠ 蓝牙断开')
+            if self.on_lost:
+                self.on_lost()
+        self.client = BleakClient(dev, disconnected_callback=lost)
         await self.client.connect()
         loop = asyncio.get_running_loop()
 
@@ -369,18 +386,21 @@ class Esp:
         print(f'已连接 {dev.name or dev.address}')
 
     async def press(self, ms):
+        """按 ms 毫秒。回传 True = ESP 有回 D（按完）；False = 没回（按时间估，可能没按到）。"""
         self.done.clear()
         await self.client.write_gatt_char(RX, f'P{ms}'.encode(), response=True)
         try:   # 等 ESP 回 D（按完）；没回就按时间估
             await asyncio.wait_for(self.done.wait(), timeout=ms / 1000 + 3)
+            return True
         except asyncio.TimeoutError:
-            pass
+            return False
 
     async def send(self, cmd):
         """直接送一个指令（M<角度> 即时转动、A<静止>,<压下> 存角度、G 读角度）。"""
         await self.client.write_gatt_char(RX, cmd.encode(), response=True)
 
     async def close(self):
+        self.closing = True
         if self.client:
             try:
                 await self.client.disconnect()

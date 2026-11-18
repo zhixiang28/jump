@@ -47,6 +47,9 @@ class App:
         self.loop = asyncio.new_event_loop()        # 蓝牙用的 asyncio 迴圈（在背景执行绪跑）
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self.esp = None
+        self.connecting = False
+        self.ble_retry = 0         # 蓝牙断掉后自动重连试了几次
+        self.ble_resume = False    # 重连成功后要不要继续 AI 自动玩
         self.adb = None
         self.stream_lock = threading.Lock()
         self.stream_starts = 0
@@ -83,6 +86,8 @@ class App:
         self.cfg.setdefault('target_score', 0)     # 目标分数：AI 自动玩到这个分数就故意失误结束（0 = 不限）
         self.reset_msg = ''
         self.cfg['k_foot'] = 0                     # 「小人高度修正」已经拿掉（不稳定）
+        if 'x_shift' not in self.cfg:              # 瞄准左右修正：第一次用从以前 Perfect 的那几跳估起始值
+            self.cfg['x_shift'] = learn.x_shift_initial(self.store)
         if not learn.sane_calibration(self.cfg):   # 例如之前学坏的 k = 0.30、b = 524，或 k = 1.70、b = −50
             old = (self.cfg.get('k'), self.cfg.get('b'))
             f = learn.fit_land(self.store, cfg=dict(self.cfg, calib_since=0))   # 先试着用以前量到的落点重算
@@ -385,6 +390,8 @@ class App:
             extra.append(f'右上 {self.cfg["k_side"]:+.0f} ms')
         if self.cfg.get('k_small'):
             extra.append(f'从小平台起跳 {self.cfg["k_small"]:+.0f} ms')
+        if self.cfg.get('x_shift'):
+            extra.append(f'瞄准往{"右" if self.cfg["x_shift"] > 0 else "左"}挪 {abs(self.cfg["x_shift"]):.0f}')
         if self.cfg.get('k_foot'):
             extra.append(f'高度修正 {self.cfg["k_foot"]:+.0f}')
         self.info_lbl.config(text=f'目前：k = {self.cfg["k"]}，b = {self.cfg["b"]} ms'
@@ -691,22 +698,62 @@ class App:
 
     # ------------------------------------------------------------ 蓝牙 / 按
     def connect(self):
-        if self.esp:
+        if self.esp or self.connecting:
             return
+        self.connecting = True
         self.bt.config(text='搜索中…', state='disabled')
-        self.status('搜索 ESP32 中…（ESP32 同时只能连一个装置，其他手机或电脑连着要先断开）')
+        self.status('搜索 ESP32 中…（ESP32 同时只能连一个装置，其他手机或电脑连着要先断开）'
+                    + (f'（自动重连第 {self.ble_retry} 次）' if self.ble_retry else ''))
         esp = jb.Esp(self.cfg)
         self.bg_async(esp.connect(), lambda _, err: self.after_connect(esp, err))
 
     def after_connect(self, esp, err):
+        self.connecting = False
         if err:
-            self.bt.config(text='连接蓝牙', state='normal')
+            self.bt.config(text='连接蓝牙', bg='#3b7cff', state='normal')
+            self.bg_async(esp.close(), lambda *_: None)          # 连到一半失败：确定放掉，ESP32 才能再被连
+            if self.ble_retry and self.ble_retry < 3 and not self.closing:
+                self.ble_retry += 1
+                self.status(f'重新连接失败：{err}，3 秒后再试（第 {self.ble_retry} 次）', 'warn')
+                self.root.after(3000, self.connect)
+                return
+            if self.ble_retry:
+                self.store.event('ble_reconnect', ok=False, err=str(err)[:200])
+            self.ble_retry, self.ble_resume = 0, False
             self.status(f'连接失败：{err}', 'err'); return
         self.esp = esp
         self.bt.config(text='🔗 已连接', bg='#1fa955', state='normal')
-        self.status('已连接 ESP32 ✓', 'ok')
         esp.on_angles = lambda r, p: self.q.put(lambda: self.got_angles(r, p))   # 蓝牙执行绪 → 介面
+        esp.on_lost = lambda: self.q.put(lambda: self.ble_lost(esp, '蓝牙断开'))
         self.bg_async(esp.send('G'), lambda _, err: None)                      # 读板子上的角度
+        if self.ble_retry:
+            self.store.event('ble_reconnect', ok=True, tries=self.ble_retry)
+        resume, self.ble_retry, self.ble_resume = self.ble_resume, 0, False
+        if resume and not self.v_play.get():
+            self.status('蓝牙重新连上了 ✓ 继续 AI 自动玩', 'ok')
+            self.v_play.set(True)
+            self.auto_fail = 0
+            self.refresh(stable=True)                   # 重新看一次画面 → 预测完会接着跳
+        else:
+            self.status('已连接 ESP32 ✓', 'ok')
+
+    def ble_lost(self, esp, why):
+        """蓝牙断了（ESP32 没电、太远、被干扰…）：自动重连；AI 正在玩的话，连上后继续。"""
+        if esp is not self.esp:
+            return                                       # 已经处理过（或是旧的连线）
+        self.esp = None
+        self.bg_async(esp.close(), lambda *_: None)      # 放掉旧连线，不然 ESP32 可能一直以为还连着
+        playing = self.v_play.get()
+        self.store.event('ble_lost', why=str(why)[:200], playing=playing)
+        if playing:
+            self.v_play.set(False)
+        self.bt.config(text='连接蓝牙', bg='#3b7cff', state='normal')
+        if self.closing:
+            return
+        self.ble_resume = playing
+        self.ble_retry = 1
+        self.status(f'⚠ {why}，自动重新连接中…' + ('（连上后继续 AI 自动玩）' if playing else ''), 'warn')
+        self.root.after(1000, self.connect)
 
     # ------------------------------------------------------------ Servo 角度
     def got_angles(self, r, p):
@@ -787,7 +834,8 @@ class App:
 
     def press_extra(self):
         """每一跳额外记下来的东西（导出后用来重新校准）。"""
-        return {'k_used': self.cfg['k'], 'b_used': self.cfg['b'], 't_press': round(time.time(), 3),
+        return {'k_used': self.cfg['k'], 'b_used': self.cfg['b'], 'x_shift_used': self.cfg.get('x_shift', 0),
+                't_press': round(time.time(), 3),
                 'proj': bool(self.cfg.get('gui_proj')), 'angle': self.cfg.get('jump_angle_deg'), 'score': self.score}
 
     def make_jump(self, a, b, units):
@@ -811,17 +859,23 @@ class App:
         self.busy = True
         self.press_btn.config(state='disabled')
         self.status(f'按 {ms} ms…')
-        self.bg_async(self.esp.press(ms), lambda _, err: self.after_press(ms, err))
+        esp = self.esp
+        self.bg_async(esp.press(ms), lambda acked, err: self.after_press(ms, err, acked, esp))
         return True
 
-    def after_press(self, ms, err):
+    def after_press(self, ms, err, acked=True, esp=None):
         if err:
             self.busy = False; self.press_btn.config(state='normal')
-            self.status(f'按压失败：{err}（蓝牙可能断了，重新连接）', 'err')
-            self.esp = None; self.bt.config(text='连接蓝牙', bg='#3b7cff')
+            self.pending = None                               # 没按成：不要拿下一张画面量这一跳的落点
+            self.ble_lost(esp or self.esp, f'按压失败（{err}）')
             return
         if self.cur_rec is not None and self.cur_rec.get('ms') == ms:
-            self.cur_rec['t_done'] = round(time.time(), 3)      # ESP 回报按完的时间
+            if acked:
+                self.cur_rec['t_done'] = round(time.time(), 3)  # ESP 回报按完的时间
+            else:
+                self.cur_rec['no_ack'] = True
+        if not acked:                                     # ESP 没回「按完」：可能没收到指令，记下来方便查
+            self.store.event('press_no_ack', ms=ms)
         self.status(f'已按 {ms} ms ✓ 等画面停下来量落点…', 'ok')
 
         def done():
@@ -879,10 +933,12 @@ class App:
         if land.get('lost'):
             if rec.get('end_game'):
                 self.status(f'🏁 目标分数达成，这一局已结束（最后分数 {rec.get("score")}）', 'ok')
+                if self.v_play.get():
+                    self.v_play.set(False)
             else:
-                self.status('⚠ 跳完找不到小人：可能掉下去了（游戏结束？）', 'err')
-            if self.v_play.get():
-                self.v_play.set(False)
+                # 不要马上停：有时只是动画 / 奖励画面挡住（上次就这样停了，游戏其实还在继续）。
+                # AI 接着会再看几次画面，真的找不到小人（游戏结束）才会停。
+                self.status('⚠ 跳完找不到小人：再看一次…（可能掉下去了）', 'warn')
             return
         e, units = land['err'], jump['units']
         aim = rec.get('aim', 0) or 0
@@ -903,6 +959,13 @@ class App:
         else:
             msg = ('跳过头' if e > 0 else '不够远') + f' {abs(e):.0f}（{pct:+.1f}%）'
         msg += self.calibrate(rec, jump)
+        xs, x_old = learn.x_shift_update(self.cfg, rec), self.cfg.get('x_shift', 0)
+        if xs is not None and xs != x_old:
+            self.store.event('x_shift', old=x_old, new=xs, id=rec['id'])
+            self.cfg['x_shift'] = xs
+            jb.save_config(self.cfg); self.show_info(); self.recalc()
+            msg += f'（没拿到 Perfect、落点偏{"左" if xs > x_old else "右"} → 瞄准修正 {xs:+.0f}）'
+
         self.status('落点：' + msg, 'ok' if abs(pct) < 3 else 'warn')
 
     def calibrate(self, rec, jump):
@@ -1103,8 +1166,13 @@ def main():
     root = tk.Tk()
     app = App(root)
 
-    def on_close():                                  # 关视窗时把手机的休眠设定还原、关掉串流
+    def on_close():                                  # 关视窗时把手机的休眠设定还原、关掉串流、断开蓝牙
         app.closing = True
+        if app.esp is not None:                      # 好好断开：不然 ESP32 可能以为还连着，下次开程式连不上
+            try:
+                asyncio.run_coroutine_threadsafe(app.esp.close(), app.loop).result(timeout=3)
+            except Exception:  # noqa: BLE001
+                pass
         try:
             if jb.STREAM is not None:
                 jb.STREAM.stop()

@@ -13,6 +13,7 @@
 
 串流连不上或中断时，jump_bot.screenshot() 会自动退回原本的截图方式。
 """
+import hashlib
 import os
 import socket
 import subprocess
@@ -26,21 +27,34 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER_VERSION = '3.3.1'
 SERVER_FILE = os.path.join(HERE, f'scrcpy-server-v{SERVER_VERSION}')
 SERVER_URL = f'https://github.com/Genymobile/scrcpy/releases/download/v{SERVER_VERSION}/scrcpy-server-v{SERVER_VERSION}'
+# 官方档案的 SHA-256：下载下来的（或资料夹里原本就有的）不一样就不用（档案坏了 / 被换掉，不能推到手机上执行）
+SERVER_SHA256 = 'a0f70b20aa4998fbf658c94118cd6c8dab6abbb0647a3bdab344d70bc1ebcbb8'
 DEVICE_PATH = '/data/local/tmp/scrcpy-server-servo.jar'
 MOTION_THR = 3.0          # 小图（64×140 灰阶）平均差超过这个值 = 画面在动（雪花飘只会差一点点）
 STALL_SEC = 3.0           # 等画面时，这么久完全没收到新画面 = 串流卡住了（游戏有雪花在飘，正常一直会有新画面）
 
 
+def _sha256(path):
+    with open(path, 'rb') as f:
+        return hashlib.sha256(f.read()).hexdigest()
+
+
 def ensure_server():
-    """手机端小程序：没有就从 scrcpy 官方 GitHub 下载（约 90 KB）。回传 (路径 或 None, 说明)。"""
-    if os.path.isfile(SERVER_FILE) and os.path.getsize(SERVER_FILE) > 10000:
-        return SERVER_FILE, ''
+    """手机端小程序：没有就从 scrcpy 官方 GitHub 下载（约 90 KB），并核对 SHA-256。回传 (路径 或 None, 说明)。"""
+    if os.path.isfile(SERVER_FILE):
+        if _sha256(SERVER_FILE) == SERVER_SHA256:
+            return SERVER_FILE, ''
+        try:
+            os.remove(SERVER_FILE)                    # 坏掉 / 不对的档案：删掉重新下载
+        except OSError:
+            pass
     try:
         tmp = SERVER_FILE + '.part'
         with urllib.request.urlopen(SERVER_URL, timeout=30) as r, open(tmp, 'wb') as f:
             f.write(r.read())
-        if os.path.getsize(tmp) < 10000:
-            raise RuntimeError('下载的档案太小')
+        if _sha256(tmp) != SERVER_SHA256:
+            os.remove(tmp)
+            raise RuntimeError('下载的档案核对不符（SHA-256 不对）')
         os.replace(tmp, SERVER_FILE)
         return SERVER_FILE, '已下载 scrcpy-server'
     except Exception as e:  # noqa: BLE001
@@ -60,7 +74,8 @@ class ScrcpyStream:
         self.sock = None
         self.thread = None
         self.lock = threading.Lock()
-        self.frame = None                     # 最新的一张（PIL Image）
+        self.frame = None                     # 最新的一张（解码后的 av.VideoFrame；要用时才转成图片）
+        self._img = None                      # self.frame 转好的 PIL 图片（快取）
         self.frame_t = 0.0
         self.frames = 0
         self.last_motion = time.time()
@@ -135,7 +150,7 @@ class ScrcpyStream:
             err = self.error or self._server_output() or '没有收到画面'
             self.stop()
             return False, f'串流没有画面：{err}'
-        return True, f'影像串流（{self.frame.size[0]}×{self.frame.size[1]}）'
+        return True, f'影像串流（{self.frame.width}×{self.frame.height}）'
 
     def _drain(self, proc):
         try:
@@ -194,14 +209,15 @@ class ScrcpyStream:
         self.running = False
 
     def _on_frame(self, fr):
+        # 每秒最多 30 张：只算判断「画面在不在动」用的小灰阶图；整张转成图片很花 CPU，等真的要用（latest）才转
         small = fr.reformat(width=64, height=140, format='gray').to_ndarray().astype(np.float32)
-        img = fr.to_image()
         now = time.time()
         with self.lock:
             if self.prev_small is not None and float(np.abs(small - self.prev_small).mean()) > MOTION_THR:
                 self.last_motion = now
             self.prev_small = small
-            self.frame = img
+            self.frame = fr
+            self._img = None
             self.frame_t = now
             self.frames += 1
 
@@ -227,7 +243,15 @@ class ScrcpyStream:
 
     def latest(self):
         with self.lock:
-            return self.frame.copy() if self.frame is not None else None
+            fr, img = self.frame, self._img
+        if fr is None:
+            return None
+        if img is None:
+            img = fr.to_image()
+            with self.lock:
+                if self.frame is fr:
+                    self._img = img
+        return img.copy()
 
     def wait_stable(self, quiet=0.45, timeout=8.0):
         """等画面停下来（呼叫之后，连续 quiet 秒没有明显变化）再回传最新画面。超过 timeout 就回传当下的画面。
