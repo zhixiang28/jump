@@ -220,6 +220,32 @@ class App:
         self.hist.tag_configure('bad', foreground='#ff7b66')
         self.hist.pack(fill='x')
 
+        # Servo 角度卡
+        c = card(colB, '🦾 Servo 角度（拖动时 servo 会跟着转，调好按「保存到板子」）')
+        self.ang = {}
+        for key, label, default in (('servo_rest', '静止', 0), ('servo_push', '压下', 90)):
+            self.cfg.setdefault(key, default)
+            f = tk.Frame(c, bg=CARD); f.pack(fill='x', pady=2)
+            tk.Label(f, text=label, font=FONT_B, bg=CARD, fg=TEXT, width=4, anchor='w').pack(side='left')
+            var = tk.IntVar(value=int(self.cfg[key]))
+            btn(f, '−', lambda k=key: self.nudge_angle(k, -1), font=FONT_B, width=2).pack(side='left')
+            sc = tk.Scale(f, from_=0, to=180, orient='horizontal', variable=var, showvalue=True, length=200,
+                          bg=CARD, fg=TEXT, troughcolor='#30343c', highlightthickness=0, font=FONT,
+                          command=lambda v, k=key: self.on_angle(k, int(float(v))))
+            sc.pack(side='left', fill='x', expand=True, padx=4)
+            btn(f, '＋', lambda k=key: self.nudge_angle(k, 1), font=FONT_B, width=2).pack(side='left')
+            self.ang[key] = var
+        ar = tk.Frame(c, bg=CARD); ar.pack(fill='x', pady=(6, 0))
+        for text, cmd in (('去静止位', lambda: self.live_angle(self.ang['servo_rest'].get())),
+                          ('去压下位', lambda: self.live_angle(self.ang['servo_push'].get())),
+                          ('试按 300ms', self.try_press)):
+            btn(ar, text, cmd, font=FONT).pack(side='left', padx=(0, 6))
+        btn(ar, '保存到板子', self.save_angles, bg='#3b7cff', fg='#fff', font=FONT_B).pack(side='left')
+        self.ang_lbl = tk.Label(c, text='未连接时显示的是上次保存的值', font=('Microsoft YaHei UI', 9), bg=CARD, fg=SUB)
+        self.ang_lbl.pack(anchor='w', pady=(4, 0))
+        self._live_busy = False
+        self._live_pending = None
+
         # 设定卡
         c = card(colB, '⚙ 设定')
 
@@ -605,7 +631,7 @@ class App:
         if self.esp:
             return
         self.bt.config(text='搜索中…', state='disabled')
-        self.status('搜索 ESP32 中…（请先关掉手机网页上的蓝牙连接）')
+        self.status('搜索 ESP32 中…（ESP32 同时只能连一个装置，其他手机或电脑连着要先断开）')
         esp = jb.Esp(self.cfg)
         self.bg_async(esp.connect(), lambda _, err: self.after_connect(esp, err))
 
@@ -616,6 +642,69 @@ class App:
         self.esp = esp
         self.bt.config(text='🔗 已连接', bg='#1fa955', state='normal')
         self.status('已连接 ESP32 ✓', 'ok')
+        esp.on_angles = lambda r, p: self.q.put(lambda: self.got_angles(r, p))   # 蓝牙执行绪 → 介面
+        self.bg_async(esp.send('G'), lambda _, err: None)                      # 读板子上的角度
+
+    # ------------------------------------------------------------ Servo 角度
+    def got_angles(self, r, p):
+        self._setting_angles = True                  # 程式更新滑杆：不要让 servo 跟着转（不然会停在压下位）
+        try:
+            for key, v in (('servo_rest', r), ('servo_push', p)):
+                self.ang[key].set(v); self.cfg[key] = v
+            self.root.update_idletasks()
+        finally:
+            self.root.after(50, lambda: setattr(self, '_setting_angles', False))
+        jb.save_config(self.cfg)
+        self.ang_lbl.config(text=f'板子上的设定：静止 {r}°，压下 {p}°')
+
+    def on_angle(self, key, v):
+        if getattr(self, '_setting_angles', False):
+            return
+        self.cfg[key] = v
+        jb.save_config(self.cfg)
+        self.live_angle(v)
+
+    def nudge_angle(self, key, d):
+        v = max(0, min(180, self.ang[key].get() + d))
+        self.ang[key].set(v)
+        self.on_angle(key, v)
+
+    def live_angle(self, v):
+        """拖动时让 servo 跟着转（M<角度>）。蓝牙一次只能送一个，忙的时候只留最新的值。"""
+        if not self.esp:
+            return
+        if self._live_busy:
+            self._live_pending = v; return
+        self._live_busy = True
+
+        def done(_, err):
+            self._live_busy = False
+            if self._live_pending is not None:
+                n, self._live_pending = self._live_pending, None
+                self.live_angle(n)
+        self.bg_async(self.esp.send(f'M{int(v)}'), done)
+
+    def save_angles(self, then=None):
+        if not self.esp:
+            self.status('还没连接蓝牙', 'warn'); return
+        r, p = self.ang['servo_rest'].get(), self.ang['servo_push'].get()
+
+        def done(_, err):
+            if err:
+                self.status(f'保存角度失败：{err}', 'err'); return
+            self.ang_lbl.config(text=f'已保存到板子：静止 {r}°，压下 {p}°')
+            self.store.event('servo_angles', rest=r, push=p)
+            self.status(f'角度已保存到板子 ✓（静止 {r}°，压下 {p}°）。换了角度记得按「🔧 我调整了装置」', 'ok')
+            if then:
+                then()
+        self.bg_async(self.esp.send(f'A{r},{p}'), done)
+
+    def try_press(self):
+        """先存角度再试按 300ms，确保用的是现在的角度。"""
+        if not self.esp:
+            self.status('还没连接蓝牙', 'warn'); return
+        self.save_angles(then=lambda: self.bg_async(self.esp.press(300), lambda _, err: self.status(
+            '试按 300ms ✓' if not err else f'试按失败：{err}', 'ok' if not err else 'err')))
 
     def press_line(self):
         if not self.units:
