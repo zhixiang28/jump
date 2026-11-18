@@ -30,6 +30,15 @@ LOG = os.path.join(DATA, 'log.json')
 EVENTS = os.path.join(DATA, 'events.csv')
 EXPORT = os.path.join(HERE, 'export')
 
+
+def set_data_dir(d):
+    """换成某支手机自己的资料夹（profiles.py）。"""
+    global DATA, SHOTS, LOG, EVENTS
+    DATA = d
+    SHOTS = os.path.join(d, 'shots')
+    LOG = os.path.join(d, 'log.json')
+    EVENTS = os.path.join(d, 'events.csv')
+
 NW = 540            # 学习 / 比对用的截图宽度
 MAX_RECS = 300
 KEEP_MANUAL = 60    # 你自己画的纪录（小人模板、目标记忆的来源）最多保留几笔，不会被 AI 的纪录挤掉
@@ -1102,7 +1111,8 @@ def fit_kb(store, proj=True):
 def export(store, cfg, extra_info=None):
     """把学习纪录、设定、操作纪录、截图打包成一个 zip（pc/export/）。回传 zip 路径。"""
     os.makedirs(EXPORT, exist_ok=True)
-    name = 'servo_export_' + time.strftime('%Y%m%d-%H%M%S') + '.zip'
+    tag = ''.join(c for c in str((extra_info or {}).get('手机', '')) if c.isalnum())[:20]
+    name = 'servo_export_' + (tag + '_' if tag else '') + time.strftime('%Y%m%d-%H%M%S') + '.zip'
     path = os.path.join(EXPORT, name)
     recs = store.recs
 

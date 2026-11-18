@@ -13,6 +13,7 @@
      并在你玩的时候偷偷预测（紫色虚线），跟你画的比较；够准了再打开「AI 自动玩」。
 """
 import asyncio
+import json
 import math
 import os
 import subprocess
@@ -29,6 +30,7 @@ from PIL import Image, ImageTk
 
 import jump_bot as jb
 import learn
+import profiles
 import stream
 
 FONT = ('Microsoft YaHei UI', 11)
@@ -40,6 +42,8 @@ CARD = '#1d2026'
 class App:
     def __init__(self, root):
         self.root = root
+        self.phone = getattr(root, 'phone_name', '')   # 这支手机的设定（profiles.py）
+        self.phone_note = getattr(root, 'phone_note', '')
         self.cfg = jb.load_config()
         for k, v in {'gui_auto': False, 'gui_proj': True, 'gui_live': False}.items():
             self.cfg.setdefault(k, v)
@@ -109,7 +113,7 @@ class App:
     # ------------------------------------------------------------ 介面
     def build(self):
         r = self.root
-        r.title('Servo Press · 手机画面画线')
+        r.title('Servo Press · ' + (self.phone or '手机画面画线'))
         r.configure(bg=BG)
         sw, sh = r.winfo_screenwidth(), r.winfo_screenheight()
         self.wide = sw >= 1150                     # 够宽就三栏；太窄就两栏（右边捲动）
@@ -458,7 +462,8 @@ class App:
             self.status(str(err or err_msg), 'err'); return
         self.refresh()
         src = getattr(self, 'source_info', '') or f'截图（{jb.SCREENCAP_INFO}）'
-        self.status(self.reset_msg or f'画面来源：{src}', 'warn' if self.reset_msg else 'ok')
+        phone = f'手机：{self.phone}' + (f'（{self.phone_note}）' if self.phone_note else '') + '\n' if self.phone else ''
+        self.status(phone + (self.reset_msg or f'画面来源：{src}'), 'warn' if (self.reset_msg or self.phone_note) else 'ok')
 
     def start_stream(self):
         """开影像串流（背景执行绪里呼叫）。失败就用原本的截图方式。"""
@@ -726,7 +731,13 @@ class App:
         self.bt.config(text='🔗 已连接', bg='#1fa955', state='normal')
         esp.on_angles = lambda r, p: self.q.put(lambda: self.got_angles(r, p))   # 蓝牙执行绪 → 介面
         esp.on_lost = lambda: self.q.put(lambda: self.ble_lost(esp, '蓝牙断开'))
-        self.bg_async(esp.send('G'), lambda _, err: None)                      # 读板子上的角度
+        addr = getattr(esp, 'address', '')
+        if addr and addr != self.cfg.get('ble_addr'):
+            self.cfg['ble_addr'] = addr                  # 记住这支手机用哪块板子
+            jb.save_config(self.cfg)
+        # 每支手机的 servo 角度不一样：先把这支手机的角度写到板子，再读回来确认
+        r_, p_ = int(self.cfg.get('servo_rest', 0)), int(self.cfg.get('servo_push', 90))
+        self.bg_async(esp.send(f'A{r_},{p_}'), lambda _, err: self.bg_async(esp.send('G'), lambda *a: None))
         if self.ble_retry:
             self.store.event('ble_reconnect', ok=True, tries=self.ble_retry)
         resume, self.ble_retry, self.ble_resume = self.ble_resume, 0, False
@@ -1058,7 +1069,7 @@ class App:
         if not self.store.recs:
             self.status('还没有资料可以导出（先玩几跳）', 'warn'); return
         self.export_btn.config(state='disabled', text='导出中…')
-        info = {'截图方式': jb.SCREENCAP_INFO, '画面来源': getattr(self, 'source_info', ''), '串流开启次数': self.stream_starts}
+        info = {'手机': self.phone, '截图方式': jb.SCREENCAP_INFO, '画面来源': getattr(self, 'source_info', ''), '串流开启次数': self.stream_starts}
         if self.img:
             info['手机截图大小'] = f'{self.img.size[0]}x{self.img.size[1]}'
         self.bg(lambda: learn.export(self.store, dict(self.cfg), info), self.after_export)
@@ -1179,6 +1190,45 @@ class App:
         return random.uniform(lo, hi) * random.choice((-1, 1))
 
 
+def choose_phone(root):
+    """认手机、切到那支手机的设定。两支都插着就让你选。"""
+    try:
+        with open(profiles.LEGACY_CONFIG, encoding='utf-8') as f:
+            adb_cfg = json.load(f)
+    except Exception:  # noqa: BLE001
+        adb_cfg = {}
+    adb = jb.find_adb(adb_cfg)
+    devs = [d for d in profiles.list_devices(adb) if d['state'] == 'device'] if adb else []
+    pick = None
+    if len(devs) == 1:
+        pick = devs[0]
+    elif len(devs) > 1:
+        root.withdraw()
+        win = tk.Toplevel(root)
+        win.title('选择手机')
+        win.configure(bg=BG, padx=24, pady=18)
+        tk.Label(win, text='接着两支以上的手机，这次要用哪一支？', font=FONT_B, bg=BG, fg=TEXT).pack(pady=(0, 12))
+        idx = profiles.load_index()
+        res = {}
+        for d in devs:
+            label = profiles.display_name(d['serial'], d['model']) + ('' if d['serial'] in idx else '（第一次用）')
+            tk.Button(win, text=label, font=FONT_B, bg='#3b7cff', fg='#fff', relief='flat', padx=14, pady=8,
+                      command=lambda d=d: (res.update(d=d), win.destroy())).pack(fill='x', pady=4)
+        win.protocol('WM_DELETE_WINDOW', win.destroy)
+        root.wait_window(win)
+        pick = res.get('d') or devs[0]
+        root.deiconify()
+    if pick is None:                                 # 没接手机：先用上次那支的设定（接上后重开程式）
+        serial, model = profiles.last_used()
+        if serial is None:
+            return
+        pick = {'serial': serial, 'model': model}
+    d, name, note = profiles.activate(pick['serial'], pick['model'])
+    jb.CONFIG_PATH = os.path.join(d, 'jump_config.json')
+    learn.set_data_dir(os.path.join(d, 'data'))
+    root.phone_name, root.phone_note = name, note
+
+
 def main():
     try:   # Windows 高解析度萤幕：避免视窗模糊、座标偏移
         import ctypes
@@ -1186,6 +1236,7 @@ def main():
     except Exception:  # noqa: BLE001
         pass
     root = tk.Tk()
+    choose_phone(root)
     app = App(root)
 
     def on_close():                                  # 关视窗时把手机的休眠设定还原、关掉串流、断开蓝牙
