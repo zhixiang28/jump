@@ -953,6 +953,7 @@ def export(store, cfg, extra_info=None):
                        f'（{fl["terms"]}，{fl["n"]} 跳，±{fl["rms"]:.1f} ms，另一半资料测 ±{fl["cv"]:.1f} ms）' if fl else '资料不够'),
         f'学到的跳跃角度：{learned_angle(store)}',
         f'电脑：{platform.platform()}，Python {platform.python_version()}',
+        f'影像串流设定：{cfg.get("use_stream", True)}',
     ] + [f'{k}：{v}' for k, v in (extra_info or {}).items()]
 
     with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as z:

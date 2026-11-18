@@ -166,9 +166,16 @@ def adb_reconnect(adb):
             pass
 
 
+STREAM = None               # stream.ScrcpyStream：影像串流开着时，截图直接拿串流的最新画面
+
+
 def screenshot(adb, tries=3):
-    """截图。手机偶尔会卡住：每次最多等 SHOT_TIMEOUT 秒，失败就换另一种方式再试；
+    """截图。影像串流开着就直接用串流的最新画面（不会卡住）；否则用 screencap。手机偶尔会卡住：每次最多等 SHOT_TIMEOUT 秒，失败就换另一种方式再试；
     第二次失败时让 adb 重新连线。全部失败才丢出错误。"""
+    if STREAM is not None and STREAM.alive:
+        im = STREAM.latest()
+        if im is not None:
+            return im
     order = [SCREENCAP_MODE, 'png' if SCREENCAP_MODE == 'raw' else 'raw']
     last = None
     for i in range(tries):

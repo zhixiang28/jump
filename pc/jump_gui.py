@@ -29,6 +29,7 @@ from PIL import Image, ImageTk
 
 import jump_bot as jb
 import learn
+import stream
 
 FONT = ('Microsoft YaHei UI', 11)
 FONT_B = ('Microsoft YaHei UI', 11, 'bold')
@@ -71,6 +72,7 @@ class App:
         self.shot_fail = 0         # 连续截图失败次数
         self.awake_old = None      # 手机原本的「接着电源不休眠」设定（结束时还原）
         self.cfg.setdefault('auto_calib', True)
+        self.cfg.setdefault('use_stream', True)    # 用 scrcpy 影像串流取得画面（不会像截图那样卡住）
         self.cfg.setdefault('miss_pct', 10)        # AI 自动玩时，故意不跳正中的机率（%）
         self.cfg.setdefault('miss_amount', 0.6)    # 故意偏离最多到「中心→边缘」距离的几成
         self.cfg.setdefault('target_score', 0)     # 目标分数：AI 自动玩到这个分数就故意失误结束（0 = 不限）
@@ -186,6 +188,7 @@ class App:
         self.v_proj = check(c, '只算沿跳跃方向的距离', 'gui_proj', self.recalc)
         self.v_live = check(c, '自动刷新画面（每 1.5 秒）', 'gui_live')
         self.v_calib = check(c, '跳完自动量落点、校准 k/b', 'auto_calib')
+        self.v_stream = check(c, '用影像串流取得画面（下次开启生效）', 'use_stream')
 
         # 学习卡
         c = card(colB, '🧠 学习')
@@ -397,7 +400,9 @@ class App:
             err = jb.check_device(self.adb)
             if not err:
                 self.awake_old = jb.keep_awake(self.adb)   # 接着 USB 时手机不休眠（暗掉时截图常卡住）
-                jb.pick_screencap_mode(self.adb)       # 测一下哪种截图方式比较快
+                self.start_stream()
+                if not (jb.STREAM and jb.STREAM.alive):
+                    jb.pick_screencap_mode(self.adb)   # 没有串流：测一下哪种截图方式比较快
             return err
         self.bg(check, self.after_check)
         self.live_tick()
@@ -406,10 +411,35 @@ class App:
         if err or err_msg:
             self.status(str(err or err_msg), 'err'); return
         self.refresh()
-        self.status(self.reset_msg or f'截图方式：{jb.SCREENCAP_INFO}', 'warn' if self.reset_msg else 'ok')
+        src = getattr(self, 'source_info', '') or f'截图（{jb.SCREENCAP_INFO}）'
+        self.status(self.reset_msg or f'画面来源：{src}', 'warn' if self.reset_msg else 'ok')
+
+    def start_stream(self):
+        """开影像串流（背景执行绪里呼叫）。失败就用原本的截图方式。"""
+        if not self.cfg.get('use_stream', True):
+            self.source_info = '截图（影像串流已关闭）'
+            return
+        st = stream.ScrcpyStream(self.adb)
+        ok, msg = st.start()
+        if ok:
+            jb.STREAM = st
+            self.source_info = msg
+        else:
+            jb.STREAM = None
+            self.source_info = f'截图（影像串流没开成：{msg}）'
+        self.store.event('stream', ok=ok, msg=msg)
+        self.stream_tried = time.time()
 
     def grab_stable(self, tries=8):
         """等画面停下来（镜头还在移动时，跳跃方向会是歪的）：连拍两张差不多才算。"""
+        st = jb.STREAM
+        if st is not None and not st.alive and time.time() - getattr(self, 'stream_tried', 0) > 30:
+            self.start_stream()                      # 串流断了：每 30 秒最多重开一次
+            st = jb.STREAM
+        if st is not None and st.alive:
+            im = st.wait_stable()                    # 连续看画面，停下来就马上拿
+            if im is not None:
+                return im
         def small(im):
             return np.asarray(im.convert('L').resize((60, 132)), dtype=np.float32)
         a = jb.screenshot(self.adb)
@@ -986,7 +1016,12 @@ def main():
     root = tk.Tk()
     app = App(root)
 
-    def on_close():                                  # 关视窗时把手机的休眠设定还原
+    def on_close():                                  # 关视窗时把手机的休眠设定还原、关掉串流
+        try:
+            if jb.STREAM is not None:
+                jb.STREAM.stop()
+        except Exception:  # noqa: BLE001
+            pass
         if app.adb and app.awake_old is not None:
             jb.restore_awake(app.adb, app.awake_old)
         root.destroy()
