@@ -210,6 +210,8 @@ class App:
         self.v_live = tk.BooleanVar(value=False)
         self.v_calib = tk.BooleanVar(value=True)
         self.v_stream = check(c, '用影像串流取得画面（下次开启生效）', 'use_stream')
+        self.cfg.setdefault('export_all_shots', False)
+        self.v_export_all = check(c, '导出全部截图（档案很大；平常不用勾，只带有用的那几跳）', 'export_all_shots')
 
         # 学习卡
         c = card(colB, '🧠 学习')
@@ -1064,14 +1066,15 @@ class App:
         info = {'截图方式': jb.SCREENCAP_INFO, '画面来源': getattr(self, 'source_info', ''), '串流开启次数': self.stream_starts}
         if self.img:
             info['手机截图大小'] = f'{self.img.size[0]}x{self.img.size[1]}'
-        self.bg(lambda: learn.export(self.store, dict(self.cfg), info), self.after_export)
+        all_shots = bool(self.cfg.get('export_all_shots'))
+        self.bg(lambda: learn.export(self.store, dict(self.cfg), info, all_shots=all_shots), self.after_export)
 
     def after_export(self, path, err):
         self.export_btn.config(state='normal', text='📦 导出数据')
         if err:
             self.status(f'导出失败：{err}', 'err'); return
         size = os.path.getsize(path) / 1e6
-        self.status(f'已导出（{size:.1f} MB）：{path}\n把这个 zip 和录屏一起传给我', 'ok')
+        self.status(f'已导出（{size:.1f} MB）：{path}\n直接把这个 zip 传给我（不用解压）', 'ok')
         try:                                           # 打开资料夹、选中这个档案
             if sys.platform.startswith('win'):
                 subprocess.Popen(['explorer', '/select,', os.path.normpath(path)])
@@ -1127,6 +1130,10 @@ class App:
                 self.root.after(700, lambda: self.refresh(stable=True))
                 return
             self.v_play.set(False)
+            if self.img is not None:                 # 看不懂的画面存起来，导出时会带上
+                why = 'nochar' if 'score' in p and 'foot' not in p else 'notarget' if 'foot' in p else 'other'
+                self.store.save_fail(self.img, why)
+                self.store.event('ai_fail', err=str(p.get('err', ''))[:200], why=why)
             self.status(f'⏸ AI 停下来了：{p.get("err", "看不懂这个画面")}。请手动画这一跳', 'warn')
             return
         self.auto_fail = 0
