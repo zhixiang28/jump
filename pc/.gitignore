@@ -5,3 +5,5 @@ export/
 __pycache__/
 platform-tools/
 scrcpy-server-v*
+version.json
+_backup/

@@ -88,7 +88,7 @@ class App:
         self.cfg.setdefault('miss_pct', 10)        # AI 自动玩时，故意不跳正中的机率（%）
         self.cfg.setdefault('miss_amount', 0.6)    # 故意偏离最多到「中心→边缘」距离的几成
         self.cfg.setdefault('target_score', 0)     # 目标分数：AI 自动玩到这个分数就故意失误结束（0 = 不限）
-        self.reset_msg = getattr(root, 'restore_note', '')
+        self.reset_msg = '\n'.join(x for x in (getattr(root, 'update_note', ''), getattr(root, 'restore_note', '')) if x)
         self.cfg['k_foot'] = 0                     # 「小人高度修正」已经拿掉（不稳定）
         if 'x_shift' not in self.cfg:              # 瞄准左右修正：第一次用从以前 Perfect 的那几跳估起始值
             self.cfg['x_shift'] = learn.x_shift_initial(self.store)
@@ -210,6 +210,8 @@ class App:
         self.v_live = tk.BooleanVar(value=False)
         self.v_calib = tk.BooleanVar(value=True)
         self.v_stream = check(c, '用影像串流取得画面（下次开启生效）', 'use_stream')
+        self.cfg.setdefault('auto_update', True)
+        self.v_update = check(c, '开启时自动更新（从 GitHub 下载新版本）', 'auto_update')
         self.cfg.setdefault('export_all_shots', False)
         self.v_export_all = check(c, '导出全部截图（档案很大；平常不用勾，只带有用的那几跳）', 'export_all_shots')
 
@@ -1237,7 +1239,7 @@ def restore_from_profiles():
         return f'搬回手机设定时出错（{e}），用 pc 资料夹里原本的设定'
 
 
-def main():
+def main(update_note=''):
     try:   # Windows 高解析度萤幕：避免视窗模糊、座标偏移
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -1245,6 +1247,7 @@ def main():
         pass
     root = tk.Tk()
     root.restore_note = restore_from_profiles()
+    root.update_note = update_note
     app = App(root)
 
     def on_close():                                  # 关视窗时把手机的休眠设定还原、关掉串流、断开蓝牙
