@@ -551,7 +551,8 @@ def landing(im, tpls, jump, ch=None):
         return None                                     # 不太确定是不是小人：这跳不量
     face = standing_face(im, ch['foot'], jump.get('width'))
     if not face:
-        return None
+        # 脚下没有顶面：可能只是量不到，也可能是跳跌倒了（小人侧躺在地上，比对分数会变低）→ 交给程式配合分数判断
+        return {'noface': True, 'score': round(ch['score'], 3)}
     ux, uy = jump['dir']
     dx = (ch['foot'][0] - face['center'][0]) * 1000
     dy = (ch['foot'][1] - face['center'][1]) * 1000
@@ -1148,8 +1149,8 @@ def select_shots(recs, max_n=60, n_last=5, n_sample=8):
         p = r.get('pred') or {}
         if r.get('no_jump'):
             rule_lists[0].append((r, '手机没反应'))
-        if gain == 0 or (r.get('auto') and not land and not r.get('no_jump')):
-            rule_lists[0].append((r, '掉下去/游戏结束' if gain == 0 else '量不到落点'))
+        if r.get('fell') or gain == 0 or (r.get('auto') and not land and not r.get('no_jump')):
+            rule_lists[0].append((r, '跳跌倒/游戏结束' if (r.get('fell') or gain == 0) else '量不到落点'))
             for j in (i - 2, i - 1):                    # 出事之前那两跳（看是怎么走到边缘的）
                 if j >= 0:
                     rule_lists[3].append((recs[j], '出事前'))
@@ -1209,6 +1210,7 @@ def export(store, cfg, extra_info=None, all_shots=False):
         f'AI vs 你：' + (f'最近 {sh["n"]} 跳中位误差 {sh["med"] * 100:.2f}%' if sh.get('n') else '没有资料'),
         f'瞄准左右修正（x_shift）：{cfg.get("x_shift", 0)}',
         f'手机没反应的按压：{sum(1 for r in recs if r.get("no_jump"))} 次（共 {len(recs)} 跳）',
+        f'跳跌倒（游戏结束）：{sum(1 for r in recs if r.get("fell"))} 次',
         f'目前 k = {cfg.get("k")}, b = {cfg.get("b")}, 跳跃角度 {cfg.get("jump_angle_deg")}°, 投影 {cfg.get("gui_proj")}',
         '落点拟合：' + (f'k = {fl["k"]:.4f}, b = {fl["b"]:.1f}, 左右修正 {fl["k_side"]:+.1f} ms, 高度修正 {fl["k_foot"]:+.1f}'
                        f'（{fl["terms"]}，{fl["n"]} 跳，±{fl["rms"]:.1f} ms，另一半资料测 ±{fl["cv"]:.1f} ms）' if fl else '资料不够'),
@@ -1285,7 +1287,10 @@ def read_score(im):
     H = a.shape[0]
     y0, y1 = int(0.105 * H), int(0.215 * H)
     x0, x1 = int(0.18 * W0), int(0.90 * W0)
-    m = a[y0:y1, x0:x1].min(2) > 235                      # 纯白的像素
+    reg = a[y0:y1, x0:x1].min(2)
+    # 「白色」的门槛跟着这块区域最亮的地方走：影像串流的白色常常只有 235 左右（以前固定 >235，暗一点就读不到）
+    top = float(np.percentile(reg, 99.5)) if reg.size else 255.0
+    m = reg > min(235.0, max(170.0, top - 30))
     lab, sizes = _label(m)
     glyphs = []
     for L in range(1, len(sizes)):

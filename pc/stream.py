@@ -87,7 +87,8 @@ class ScrcpyStream:
 
     # ------------------------------------------------------------ 启动 / 停止
     def _adb(self, *args, timeout=15):
-        return subprocess.run([self.adb] + list(args), capture_output=True, text=True, errors='replace', timeout=timeout)
+        import jump_bot                       # 逾时不会卡死的版本（见 jump_bot.run）
+        return jump_bot.run([self.adb] + list(args), timeout=timeout, text=True)
 
     def start(self, wait_first_frame=8.0):
         """回传 (成功?, 说明)。"""
@@ -101,6 +102,8 @@ class ScrcpyStream:
             path, msg = ensure_server()
             if not path:
                 return False, msg
+            import jump_bot
+            jump_bot.start_server(self.adb)       # adb 背景服务被别的程式关掉时先开好（不会卡住）
             try:
                 r = self._adb('push', path, DEVICE_PATH, timeout=30)
                 if r.returncode != 0:
@@ -253,7 +256,7 @@ class ScrcpyStream:
                     self._img = img
         return img.copy()
 
-    def wait_stable(self, quiet=0.45, timeout=8.0):
+    def wait_stable(self, quiet=0.3, timeout=8.0):
         """等画面停下来（呼叫之后，连续 quiet 秒没有明显变化）再回传最新画面。超过 timeout 就回传当下的画面。
         只算呼叫之后看到的静止：刚开始动的画面可能还没解码出来，不能用之前的静止来判断。
         卡住（STALL_SEC 秒完全没新画面）或断掉就回传 None，让呼叫的人改用别的方法、重开串流。"""

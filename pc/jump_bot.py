@@ -116,8 +116,33 @@ def find_adb(cfg):
     return None
 
 
+def run(args, timeout, text=False):
+    """subprocess.run 的安全版。adb 的背景服务（daemon）没在跑时，第一个 adb 指令会把它带起来，
+    它会一直占着我们读输出的管线：Windows 上 subprocess.run 就算逾时也会卡死（上次程式开起来就卡在这里，
+    影像串流整局都没开）。这里逾时就直接放弃，不再等管线。"""
+    p = subprocess.Popen(args, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        out, err = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        p.kill()
+        raise
+    if text:
+        out, err = out.decode(errors='replace'), err.decode(errors='replace')
+    return subprocess.CompletedProcess(args, p.returncode, out, err)
+
+
+def start_server(adb):
+    """先把 adb 背景服务开好（不接管线，所以不会卡住），之后的 adb 指令就不会再去带起它。"""
+    try:
+        subprocess.run([adb, 'start-server'], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=20)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def check_device(adb):
-    out = subprocess.run([adb, 'devices'], capture_output=True, text=True, timeout=15).stdout
+    start_server(adb)
+    out = run([adb, 'devices'], timeout=15, text=True).stdout
     lines = [l for l in out.splitlines()[1:] if l.strip()]
     if not lines:
         return '没有找到手机：检查 USB 线，以及手机上是否开了「USB 调试」'
@@ -137,7 +162,7 @@ SHOT_TIMEOUT = 8            # 一次截图最多等几秒（手机偶尔会卡�
 
 def screenshot_raw(adb, timeout=None):
     """screencap 不加 -p：前面 12 或 16 bytes 是 宽、高、格式（1 = RGBA），后面是原始像素。"""
-    d = subprocess.run([adb, 'exec-out', 'screencap'], capture_output=True, timeout=timeout or SHOT_TIMEOUT).stdout
+    d = run([adb, 'exec-out', 'screencap'], timeout=timeout or SHOT_TIMEOUT).stdout
     if len(d) < 16:
         return None
     w, h, fmt = struct.unpack('<III', d[:12])
@@ -168,9 +193,10 @@ def pick_screencap_mode(adb):
 
 def adb_reconnect(adb):
     """adb 卡住时让它重新连线（不用拔线）。"""
+    start_server(adb)
     for args in (['reconnect'], ['wait-for-device']):
         try:
-            subprocess.run([adb] + args, capture_output=True, timeout=10)
+            run([adb] + args, timeout=10)
         except Exception:  # noqa: BLE001
             pass
 
@@ -206,9 +232,8 @@ def screenshot(adb, tries=3):
 def keep_awake(adb):
     """接着 USB 时让手机不要休眠（屏幕暗掉时截图常会卡住）。回传原本的设定，结束时用 restore_awake 还原。"""
     try:
-        old = subprocess.run([adb, 'shell', 'settings', 'get', 'global', 'stay_on_while_plugged_in'],
-                             capture_output=True, text=True, timeout=8).stdout.strip()
-        subprocess.run([adb, 'shell', 'svc', 'power', 'stayon', 'usb'], capture_output=True, timeout=8)
+        old = run([adb, 'shell', 'settings', 'get', 'global', 'stay_on_while_plugged_in'], timeout=8, text=True).stdout.strip()
+        run([adb, 'shell', 'svc', 'power', 'stayon', 'usb'], timeout=8)
         return old
     except Exception:  # noqa: BLE001
         return None
@@ -218,14 +243,13 @@ def restore_awake(adb, old):
     if old is None or not old.strip().isdigit():
         return
     try:
-        subprocess.run([adb, 'shell', 'settings', 'put', 'global', 'stay_on_while_plugged_in', old.strip()],
-                       capture_output=True, timeout=8)
+        run([adb, 'shell', 'settings', 'put', 'global', 'stay_on_while_plugged_in', old.strip()], timeout=8)
     except Exception:  # noqa: BLE001
         pass
 
 
 def screenshot_png(adb, timeout=None):
-    r = subprocess.run([adb, 'exec-out', 'screencap', '-p'], capture_output=True, timeout=timeout or SHOT_TIMEOUT)
+    r = run([adb, 'exec-out', 'screencap', '-p'], timeout=timeout or SHOT_TIMEOUT)
     data = r.stdout
     if not data.startswith(b'\x89PNG'):
         # 某些旧手机 / Windows 会把 \n 换成 \r\n
