@@ -151,6 +151,18 @@ AI 自动玩读到分数 ≥ 目标时，会**故意跳过头**结束这一局�
 - **设定档坏掉**（例如存档时当机）：设定档现在是先写暂存档再换掉，不会写到一半；万一读不了，原档会改名成 `jump_config.broken.json` 留着。
 - **截图常失败**：确认「用影像串流取得画面」有勾（状态列会显示画面来源）；换手机原厂线、接电脑机身的 USB 口；建议开勿扰模式。
 
+## ☁ 自动上传数据给 Claude（建议）
+
+设定一次之后，每局结束（或按「📦 导出数据」）会自动把精简的 zip 传到**你自己的 GitHub 私人仓库**，
+之后只要跟 Claude 说「看新数据」，它就能直接拿到，不用再手动传档案。
+1. 在 github.com 建一个新仓库，例如 `jump-data`，**一定要选 Private（私人）**。
+   如果 Claude 的 GitHub App 只装在「选定的仓库」，记得把 `jump-data` 也加进去。
+2. GitHub → Settings → Developer settings → Personal access tokens → **Fine-grained tokens** → Generate new token：
+   Repository access 只选 `jump-data`；Permissions → **Contents：Read and write**。
+3. 程式「🧠 学习」→ **☁ 自动上传**：填仓库（例如 `zhixiang28/jump-data`）和 token → 测试 → 保存。
+
+token 只存在这台电脑的 `jump_config.json`，不会放进导出的 zip。程式每次上传前都会确认仓库是私人的，公开仓库会拒绝上传。
+
 ## 📦 导出数据（让 Claude 帮你分析、升级）
 
 1. 照常玩（AI 自动玩、你画线都可以），出问题或玩完一局后，在视窗右边「🧠 学习」按 **📦 导出数据**。
