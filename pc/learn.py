@@ -1285,7 +1285,10 @@ def read_score(im):
     H = a.shape[0]
     y0, y1 = int(0.105 * H), int(0.215 * H)
     x0, x1 = int(0.18 * W0), int(0.90 * W0)
-    m = a[y0:y1, x0:x1].min(2) > 235                      # 纯白的像素
+    reg = a[y0:y1, x0:x1].min(2)
+    # 「白色」的门槛跟着这块区域最亮的地方走：影像串流的白色常常只有 235 左右（以前固定 >235，暗一点就读不到）
+    top = float(np.percentile(reg, 99.5)) if reg.size else 255.0
+    m = reg > min(235.0, max(170.0, top - 30))
     lab, sizes = _label(m)
     glyphs = []
     for L in range(1, len(sizes)):

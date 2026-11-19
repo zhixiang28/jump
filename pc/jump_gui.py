@@ -501,6 +501,8 @@ class App:
             if st is not None and st.alive:
                 fails = 0
                 continue
+            if self.closing:
+                break
             if st is not None and not getattr(st, 'reported', False):
                 st.reported = True
                 self.store.event('stream_lost', err=st.describe_error()[:300], frames=st.frames)
@@ -860,7 +862,8 @@ class App:
         return {'dir': (dx / n, dy / n), 'units': units, 'width': width,
                 'before': learn.scene_small(self.img)}             # 按之前的画面：用来判断「手机有没有反应」
 
-    def press(self, ms):
+    def press(self, ms, wake=False):
+        """wake=True：按之前先叫 servo 停在静止角度（M 指令，不会碰到屏幕），看能不能避免「隔太久第一下按得慢」。"""
         if self.busy:
             self.status('上一次还在按 / 等动画，稍等', 'warn'); return False
         if not self.esp:
@@ -869,7 +872,14 @@ class App:
         self.press_btn.config(state='disabled')
         self.status(f'按 {ms} ms…')
         esp = self.esp
-        self.bg_async(esp.press(ms), lambda acked, err: self.after_press(ms, err, acked, esp))
+        rest = int(self.cfg.get('servo_rest', 0))
+
+        async def go():
+            if wake:
+                await esp.send(f'M{rest}')
+                await asyncio.sleep(0.12)
+            return await esp.press(ms)
+        self.bg_async(go(), lambda acked, err: self.after_press(ms, err, acked, esp))
         return True
 
     def after_press(self, ms, err, acked=True, esp=None):
@@ -878,6 +888,7 @@ class App:
             self.pending = None                               # 没按成：不要拿下一张画面量这一跳的落点
             self.ble_lost(esp or self.esp, f'按压失败（{err}）')
             return
+        self.last_done = time.time()
         if self.cur_rec is not None and self.cur_rec.get('ms') == ms:
             if acked:
                 self.cur_rec['t_done'] = round(time.time(), 3)  # ESP 回报按完的时间
@@ -919,7 +930,7 @@ class App:
         self.pred = p
         self.draw(); self.update_learn()
         if self.v_play.get():
-            self.root.after(150, self.auto_step)
+            self.root.after(30, self.auto_step)              # 马上接着按：隔太久，手机 / servo 第一下会慢（跳太近）
 
     def handle_landing(self, land, pend, img=None, score_after=None, moved=None):
         jump, rec = pend
@@ -1153,7 +1164,11 @@ class App:
         else:
             aim = self.pick_aim(p)
         ms = learn.ms_for(p['units'] + aim, p['side'], p['foot'][1], self.cfg, p.get('cur_width'))
-        if self.press(ms):
+        # 上次按完到现在隔多久：隔超过约 2.7 秒，跳太近（按压被晚认到约 60 ms）的机会多很多。
+        # 实验：隔 2 秒以上的，一半先「叫醒」servo，一半不叫，下次导出就知道慢的是 servo 还是手机。
+        idle = time.time() - getattr(self, 'last_done', 0)
+        wake = idle >= 2.0 and random.random() < 0.5
+        if self.press(ms, wake=wake):
             if ending:
                 self.status(f'🏁 已到目标分数 {target}（现在 {self.score}）：故意失误，结束这一局', 'ok')
                 self.store.event('end_game', score=self.score, target=target)
@@ -1162,6 +1177,8 @@ class App:
             self.last = {'ms': ms, 'units': p['units'] + aim}
             extra = self.press_extra()
             extra['aim'] = round(aim, 1)
+            extra['idle'] = round(min(idle, 99.0), 2)
+            extra['wake'] = wake
             if ending:
                 extra['end_game'] = True
             self.cur_rec = self.store.add(self.img, a, b, p['units'], ms, pred=p, auto=True, extra=extra)
@@ -1214,7 +1231,7 @@ def restore_from_profiles():
         last = None
         try:
             adb = jb.find_adb(jb.load_config())
-            out = subprocess.run([adb, 'devices'], capture_output=True, text=True, timeout=10).stdout if adb else ''
+            out = jb.run([adb, 'devices'], timeout=10, text=True).stdout if adb else ''
             now = [l.split()[0] for l in out.splitlines()[1:] if l.strip().endswith('device')]
             last = next((k for k in now if k in idx), None)
         except Exception:  # noqa: BLE001
