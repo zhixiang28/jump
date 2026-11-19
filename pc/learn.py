@@ -236,14 +236,17 @@ def build_templates(store, max_n=12, scan=60):
     tw, th = round(TPL_W * NW), round((TPL_TOP - TPL_BOTTOM) * NW)
     # 只信你自己画的起点，避免越学越歪。一笔都没有（例如旧版把它们挤掉了）才退而用 AI 很有把握的那几跳
     use_auto = not any(not r.get('auto') for r in store.recs)
-    for rec in reversed(store.recs):
+    # 从「最早」的开始：最早那批起点点得最准（11/18：±4），同一个姿势已经有模板就不会被后来点得比较随便的取代；
+    # 后来的纪录只补充还没有的姿势
+    for rec in store.recs:
         if rec.get('auto') and not (use_auto and ((rec.get('pred') or {}).get('score') or 0) >= 0.95):
             continue
         try:
             img = as_arr(store.shot(rec), NW)
         except Exception:  # noqa: BLE001
             continue
-        fx, fy = rec['a'][0] * NW, rec['a'][1] * NW
+        fx, fy = template_foot(rec)
+        fx, fy = fx * NW, fy * NW
         x0 = round(fx - tw / 2)
         y1 = round(fy - TPL_BOTTOM * NW)
         y0 = y1 - th
@@ -260,6 +263,17 @@ def build_templates(store, max_n=12, scan=60):
         if scan <= 0:
             break
     return tpls
+
+
+def template_foot(rec):
+    """切小人模板用的「脚的位置」（屏宽比例）。
+    你画线的起点有时没点准（最近几次 x ±15、y 偏下 15）：AI 当时很有把握（比对分数 ≥ 0.85）就用 AI 找到的脚，
+    这样所有模板的「脚」都是同一个定义（以 11/18 那批很准的为准），量落点、算距离才不会忽左忽右。
+    AI 没把握（新的姿势）才用你点的位置。"""
+    p = rec.get('pred') or {}
+    if not rec.get('auto') and p.get('foot') and (p.get('score') or 0) >= 0.85:
+        return p['foot'][0], p['foot'][1]
+    return rec['a'][0], rec['a'][1]
 
 
 def half(arr):
@@ -897,9 +911,15 @@ def sane_calibration(cfg):
 MS_SPREAD_FOR_B = 150                                # 按压时间至少要有这么大的差别，才重新估 b
 
 
+def touch_glitch(rec):
+    """手机认到的按压时间跟要求的差太多（> 40 ms）：触控笔这一下没按好，不拿来校准。"""
+    t = rec.get('touch') or {}
+    return 'touch_ms' in t and abs(t['touch_ms'] - rec['ms'] + 14) > 40      # 平常手机认到的比要求的少约 14 ms
+
+
 def _land_recs(store, cfg, n):
     since = (cfg or {}).get('calib_since', 0) or 0   # 「调整了装置」之后的资料才算
-    return [r for r in store.recs if r.get('land') and (r.get('t_press') or 0) >= since][-n:]
+    return [r for r in store.recs if r.get('land') and (r.get('t_press') or 0) >= since and not touch_glitch(r)][-n:]
 
 
 def fit_land(store, n=80, cfg=None):
