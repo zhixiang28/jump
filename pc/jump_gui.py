@@ -34,6 +34,7 @@ import jump_bot as jb
 import learn
 import stream
 import touch
+import uploader
 
 FONT = ('Microsoft YaHei UI', 11)
 FONT_B = ('Microsoft YaHei UI', 11, 'bold')
@@ -230,6 +231,8 @@ class App:
         btn(lr, '清除学习', self.clear_learn, font=FONT).pack(side='left', padx=6)
         self.export_btn = btn(lr, '📦 导出数据', self.export_data, bg='#2f6f9f', fg='#fff', font=FONT)
         self.export_btn.pack(side='left')
+        self.upload_btn = btn(lr, '☁ 自动上传', self.upload_settings, font=FONT)
+        self.upload_btn.pack(side='left', padx=6)
         btn(c, '🔧 我调整了装置（换了角度等）', self.device_changed, font=FONT).pack(fill='x', pady=(6, 0))
 
         # 落点误差图
@@ -828,11 +831,14 @@ class App:
         if not rec.get('auto') or not self.esp:
             return
         t = rec['touch']
-        self.touch_hist.append('none' if t.get('no_touch') else 'short' if t.get('touch_ms', rec['ms']) - rec['ms'] < -40 else 'ok')
+        lost = t.get('touch_ms', rec['ms']) - rec['ms']          # 手机认到的比要求的少多少（负的 = 少）
+        self.touch_hist.append('none' if t.get('no_touch') else 'severe' if lost < -100 else 'short' if lost < -40 else 'ok')
         del self.touch_hist[:-15]
         self.since_angle += 1
-        none, short = self.touch_hist.count('none'), self.touch_hist.count('short')
-        if not self.cfg.get('auto_angle', True) or self.since_angle < 15 or not (none >= 2 or short >= 3):
+        none, severe = self.touch_hist.count('none'), self.touch_hist.count('severe')
+        short = self.touch_hist.count('short') + severe
+        # 按到一半断掉（少 100 ms 以上）会直接跌倒：没认到 + 认到很短的合计 3 次，或严重的 2 次，就加深
+        if not self.cfg.get('auto_angle', True) or self.since_angle < 15 or not (none + short >= 3 or none + severe >= 2):
             return
         rest, push = int(self.cfg.get('servo_rest', 0)), int(self.cfg.get('servo_push', 90))
         base = int(self.cfg.setdefault('servo_push_base', push))
@@ -1072,6 +1078,11 @@ class App:
             self.status(f'🏁 目标分数达成，这一局已结束（最后分数 {final}）', 'ok')
         else:
             self.status(f'💥 小人跳跌倒了，游戏结束（分数 {final}），AI 停下来了。重新开始一局后再按「AI 自动玩」', 'err')
+        # 设定了自动上传：一局结束就导出并上传（最多 10 分钟一次，免得连续跌倒传一堆）
+        if uploader.configured(self.cfg) and self.cfg.get('upload_on_gameover', True) \
+                and time.time() - getattr(self, 'last_auto_upload', 0) > 600:
+            self.last_auto_upload = time.time()
+            self.root.after(1500, lambda: self.export_data(auto=True))
 
     def press_ignored(self, rec, moved):
         """按了但画面完全没变（小人没跳）：触控笔没被手机认到。这跳不量、不校准；AI 会再按一次。"""
@@ -1153,9 +1164,10 @@ class App:
         self.draw_chart()
         self.update_history()
 
-    def export_data(self):
+    def export_data(self, auto=False):
         if not self.store.recs:
             self.status('还没有资料可以导出（先玩几跳）', 'warn'); return
+        self.export_auto = auto                          # True = 一局结束自动导出（不要打开资料夹）
         self.export_btn.config(state='disabled', text='导出中…')
         info = {'截图方式': jb.SCREENCAP_INFO, '画面来源': getattr(self, 'source_info', ''), '串流开启次数': self.stream_starts}
         if self.img:
@@ -1168,7 +1180,16 @@ class App:
         if err:
             self.status(f'导出失败：{err}', 'err'); return
         size = os.path.getsize(path) / 1e6
-        self.status(f'已导出（{size:.1f} MB）：{path}\n直接把这个 zip 传给我（不用解压）', 'ok')
+        if uploader.configured(self.cfg):              # 设定了自动上传：直接传到你的 GitHub 私人仓库
+            self.status(f'已导出（{size:.1f} MB），上传到 GitHub 中…', 'ok')
+            cfg = dict(self.cfg)
+            self.bg(lambda: uploader.upload(path, cfg), self.after_upload)
+            if getattr(self, 'export_auto', False):
+                return
+        else:
+            self.status(f'已导出（{size:.1f} MB）：{path}\n直接把这个 zip 传给我（不用解压）', 'ok')
+        if getattr(self, 'export_auto', False):
+            return
         try:                                           # 打开资料夹、选中这个档案
             if sys.platform.startswith('win'):
                 subprocess.Popen(['explorer', '/select,', os.path.normpath(path)])
@@ -1176,6 +1197,54 @@ class App:
                 subprocess.Popen(['open', '-R', path])
         except Exception:  # noqa: BLE001
             pass
+
+    def after_upload(self, res, err):
+        ok, msg = res if res else (False, str(err))
+        self.store.event('upload', ok=ok, msg=msg[:200])
+        self.status(('☁ ' + msg + '。跟 Claude 说「看新数据」就可以了') if ok else ('上传失败：' + msg), 'ok' if ok else 'err')
+
+    def upload_settings(self):
+        """设定自动上传到 GitHub 私人仓库。"""
+        win = tk.Toplevel(self.root)
+        win.title('☁ 自动上传数据给 Claude')
+        win.configure(bg=CARD, padx=18, pady=14)
+        steps = ('只要设定一次。之后每局结束（或按「📦 导出数据」）会自动把 zip 传到你的 GitHub 私人仓库，\n'
+                 '跟 Claude 说「看新数据」，它就能直接拿到，不用再手动传档案。\n\n'
+                 '1. 到 github.com 建一个新仓库，名称例如 jump-data，一定要选 Private（私人）\n'
+                 '2. 到 GitHub → Settings → Developer settings → Personal access tokens → Fine-grained tokens\n'
+                 '   → Generate new token：Repository access 只选 jump-data；Permissions → Contents 选 Read and write\n'
+                 '3. 把仓库名称和 token 填在下面，按「测试」，OK 就按「保存」\n\n'
+                 'token 只存在这台电脑的 jump_config.json，不会放进导出的 zip，也不要贴到聊天里。')
+        tk.Label(win, text=steps, font=('Microsoft YaHei UI', 10), bg=CARD, fg=SUB, justify='left').pack(anchor='w')
+        f = tk.Frame(win, bg=CARD); f.pack(fill='x', pady=(10, 0))
+        tk.Label(f, text='仓库（帐号/名称）', font=FONT, bg=CARD, fg=TEXT, width=14, anchor='w').grid(row=0, column=0, sticky='w')
+        e_repo = tk.Entry(f, width=36, font=FONT); e_repo.grid(row=0, column=1, pady=3)
+        e_repo.insert(0, self.cfg.get('upload_repo', 'zhixiang28/jump-data'))
+        tk.Label(f, text='token', font=FONT, bg=CARD, fg=TEXT, width=14, anchor='w').grid(row=1, column=0, sticky='w')
+        e_tok = tk.Entry(f, width=36, font=FONT, show='•'); e_tok.grid(row=1, column=1, pady=3)
+        e_tok.insert(0, self.cfg.get('upload_token', ''))
+        v_go = tk.BooleanVar(value=bool(self.cfg.get('upload_on_gameover', True)))
+        tk.Checkbutton(win, text='每局结束自动导出并上传', variable=v_go, font=FONT, bg=CARD, fg=TEXT, selectcolor='#262a31',
+                       activebackground=CARD).pack(anchor='w', pady=(6, 0))
+        res = tk.Label(win, text='', font=FONT, bg=CARD, fg=SUB, wraplength=520, justify='left'); res.pack(anchor='w', pady=6)
+
+        def values():
+            return {'upload_repo': e_repo.get().strip(), 'upload_token': e_tok.get().strip()}
+
+        def test():
+            res.config(text='测试中…', fg=SUB)
+            cfg = values()
+            self.bg(lambda: uploader.check(cfg), lambda r, err: res.config(
+                text=(r or (False, str(err)))[1], fg='#5fe08f' if r and r[0] else '#ff7b66'))
+
+        def save():
+            self.cfg.update(values(), upload_on_gameover=v_go.get())
+            jb.save_config(self.cfg)
+            self.status('☁ 自动上传设定已保存' if uploader.configured(self.cfg) else '已清除自动上传设定', 'ok')
+            win.destroy()
+        row = tk.Frame(win, bg=CARD); row.pack(fill='x')
+        for text, cmd in (('测试', test), ('保存', save), ('取消', win.destroy)):
+            tk.Button(row, text=text, command=cmd, font=FONT_B, relief='flat', padx=12, pady=4).pack(side='left', padx=(0, 8))
 
     def clear_learn(self):
         if not messagebox.askyesno('清除学习', '清除所有学习纪录和截图？（k、b 不会变）'):
@@ -1217,6 +1286,11 @@ class App:
         p = self.pred
         if p is None:
             return                                   # 还在预测，等 after_pred 再叫
+        if 'ms' in p and not p.get('cur_width') and p.get('score', 1) < 0.9:
+            # 脚下没有平台、小人也不太像站着：多半是跌倒的画面（上次 AI 就在这种画面上按，重开一局第一跳又掉下去）
+            p = {k: v for k, v in p.items() if k != 'ms'}
+            p['err'] = '小人好像没站在平台上（跌倒了、或被挡住）'
+            p['notstanding'] = True
         if 'ms' not in p:
             if self.auto_fail < 2:                   # 可能刚好在动画中：等一下再看一次
                 self.auto_fail += 1
@@ -1230,7 +1304,8 @@ class App:
                 self.status('🏁 游戏结束了（结果视窗）。按「Keep Jumping」开新的一局后，再按「AI 自动玩」', 'warn')
                 return
             if self.img is not None:                 # 看不懂的画面存起来，导出时会带上
-                why = 'nochar' if 'score' in p and 'foot' not in p else 'notarget' if 'foot' in p else 'other'
+                why = ('notstanding' if p.get('notstanding') else 'nochar' if 'score' in p and 'foot' not in p
+                       else 'notarget' if 'foot' in p else 'other')
                 self.store.save_fail(self.img, why)
                 self.store.event('ai_fail', err=str(p.get('err', ''))[:200], why=why)
             self.status(f'⏸ AI 停下来了：{p.get("err", "看不懂这个画面")}。请手动画这一跳', 'warn')

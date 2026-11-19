@@ -1229,6 +1229,7 @@ def export(store, cfg, extra_info=None, all_shots=False):
     """把学习纪录、设定、操作纪录、截图打包成一个 zip（pc/export/）。回传 zip 路径。
     预设只带「有用」那几跳的截图（select_shots）；all_shots=True 带全部。"""
     os.makedirs(EXPORT, exist_ok=True)
+    cfg = {k: v for k, v in cfg.items() if 'token' not in k}   # 上传用的 token 绝对不能放进 zip
     name = 'servo_export_' + time.strftime('%Y%m%d-%H%M%S') + '.zip'
     path = os.path.join(EXPORT, name)
     recs = store.recs
