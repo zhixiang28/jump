@@ -945,6 +945,11 @@ class App:
         perfect = gain is not None and 5 <= gain <= 40
         if gain is not None and 0 <= gain <= 40:
             rec['score_gain'] = gain
+        if land is not None and land.get('noface'):
+            # 脚下找不到顶面。分数没加（或读不到、而且小人比对分数低 = 侧躺）→ 跳跌倒了，游戏结束
+            if not perfect and (gain == 0 or (gain is None and land.get('score', 1) < 0.85)):
+                self.game_over(rec, img, score_after); return
+            land = None
         units = jump['units']
         if perfect and land is not None and not land.get('lost'):
             if 'err' not in land or abs(land['err']) / max(1.0, units) > 0.06:
@@ -992,6 +997,21 @@ class App:
             msg += f'（没拿到 Perfect、落点偏{"左" if xs > x_old else "右"} → 瞄准修正 {xs:+.0f}）'
 
         self.status('落点：' + msg, 'ok' if abs(pct) < 3 else 'warn')
+
+    def game_over(self, rec, img, score):
+        """跳跌倒了（游戏结束）：马上停 AI（不要在结束画面上继续按），画面存起来导出。"""
+        rec['fell'] = True
+        self.store.save()
+        final = score if score is not None else rec.get('score')
+        self.store.event('game_over', id=rec['id'], score=final, end_game=bool(rec.get('end_game')))
+        if img is not None:
+            self.store.save_fail(img, 'gameover')
+        if self.v_play.get():
+            self.v_play.set(False)
+        if rec.get('end_game'):
+            self.status(f'🏁 目标分数达成，这一局已结束（最后分数 {final}）', 'ok')
+        else:
+            self.status(f'💥 小人跳跌倒了，游戏结束（分数 {final}），AI 停下来了。重新开始一局后再按「AI 自动玩」', 'err')
 
     def press_ignored(self, rec, moved):
         """按了但画面完全没变（小人没跳）：触控笔没被手机认到。这跳不量、不校准；AI 会再按一次。"""
