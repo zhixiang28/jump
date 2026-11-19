@@ -82,6 +82,8 @@ class App:
         self.auto_fail = 0
         self.pending = None        # 刚按完、等着量落点的那一跳 (jump, rec)
         self.ignored = 0           # 连续几次按压手机没反应（小人没跳）
+        self.touch_hist = []       # 最近 AI 按压，手机认到的情况：'ok' / 'none'（没认到）/ 'short'（认到的少 40 ms 以上）
+        self.since_angle = 15      # 距离上次自动调角度几跳
         self.score = None          # 画面上读到的分数
         self.shot_fail = 0         # 连续截图失败次数
         self.awake_old = None      # 手机原本的「接着电源不休眠」设定（结束时还原）
@@ -212,6 +214,8 @@ class App:
         self.v_live = tk.BooleanVar(value=False)
         self.v_calib = tk.BooleanVar(value=True)
         self.v_stream = check(c, '用影像串流取得画面（下次开启生效）', 'use_stream')
+        self.cfg.setdefault('auto_angle', True)
+        self.v_auto_angle = check(c, '自动微调压下角度（手机常没认到触控时加深 1°，最多 +4°）', 'auto_angle')
         self.cfg.setdefault('auto_update', True)
         self.v_update = check(c, '开启时自动更新（从 GitHub 下载新版本）', 'auto_update')
         self.cfg.setdefault('export_all_shots', False)
@@ -818,10 +822,44 @@ class App:
                 self.live_angle(n)
         self.bg_async(self.esp.send(f'M{int(v)}'), done)
 
+    def maybe_adjust_angle(self, rec):
+        """触控笔常常没被手机认到（或认到的时间短很多）：压下角度自动加深 1°（最多比你设的多 4°）。
+        只会加深、每次至少隔 15 跳；你自己按「保存到板子」后，以你的角度重新算起。"""
+        if not rec.get('auto') or not self.esp:
+            return
+        t = rec['touch']
+        self.touch_hist.append('none' if t.get('no_touch') else 'short' if t.get('touch_ms', rec['ms']) - rec['ms'] < -40 else 'ok')
+        del self.touch_hist[:-15]
+        self.since_angle += 1
+        none, short = self.touch_hist.count('none'), self.touch_hist.count('short')
+        if not self.cfg.get('auto_angle', True) or self.since_angle < 15 or not (none >= 2 or short >= 3):
+            return
+        rest, push = int(self.cfg.get('servo_rest', 0)), int(self.cfg.get('servo_push', 90))
+        base = int(self.cfg.setdefault('servo_push_base', push))
+        new = push + (1 if push >= rest else -1)        # 往「压下」的方向多 1°
+        why = f'最近 15 跳手机没认到 {none} 次、认到的少 40 ms 以上 {short} 次'
+        if abs(new - base) > 4:
+            self.status(f'⚠ {why}，压下角度已经自动加深 4°，还是不稳：请检查触控笔头和 servo 电源', 'warn')
+            self.since_angle = 0
+            return
+        self.cfg['servo_push'] = new
+        jb.save_config(self.cfg)
+        self._setting_angles = True                     # 改滑杆时不要让 servo 跟着动
+        try:
+            self.ang['servo_push'].set(new)
+        finally:
+            self.root.after(50, lambda: setattr(self, '_setting_angles', False))
+        self.bg_async(self.esp.send(f'A{rest},{new}'), lambda *_: None)
+        self.store.event('auto_angle', old=push, new=new, base=base, none=none, short=short)
+        self.ang_lbl.config(text=f'自动调整：压下 {push}° → {new}°（你设的是 {base}°）')
+        self.status(f'🦾 {why}：压下角度自动加深 1°（{push}° → {new}°）', 'warn')
+        self.touch_hist, self.since_angle = [], 0
+
     def save_angles(self, then=None):
         if not self.esp:
             self.status('还没连接蓝牙', 'warn'); return
         r, p = self.ang['servo_rest'].get(), self.ang['servo_push'].get()
+        self.cfg['servo_push_base'] = p                 # 你自己设的角度：自动调整以这个为基准
 
         def done(_, err):
             if err:
@@ -859,6 +897,7 @@ class App:
     def press_extra(self):
         """每一跳额外记下来的东西（导出后用来重新校准）。"""
         return {'k_used': self.cfg['k'], 'b_used': self.cfg['b'], 'x_shift_used': self.cfg.get('x_shift', 0),
+                'push': self.cfg.get('servo_push'),
                 't_press': round(time.time(), 3),
                 'proj': bool(self.cfg.get('gui_proj')), 'angle': self.cfg.get('jump_angle_deg'), 'score': self.score}
 
@@ -953,6 +992,7 @@ class App:
             info = self.touch.claim(rec['t_press'], rec['ms'])   # 手机真的认到的按压时间
             if info:
                 rec['touch'] = info
+                self.maybe_adjust_angle(rec)
         if moved is not None and moved < learn.NOJUMP_DIFF and not rec.get('end_game') \
                 and (score_after is None or score_after == rec.get('score')):
             self.press_ignored(rec, moved); return
