@@ -395,7 +395,7 @@ def _dilate(m):
     return d
 
 
-def find_face(img, fx, fy, angle_deg, Wn, kind='cream'):
+def find_face(img, fx, fy, angle_deg, Wn, kind='cream', origin=None, offset=0.0):
     """用顶面的颜色找目标：几乎每个方块的顶面都是同一种奶油色 (≈250,237,205)；金币的顶面是金色。
     沿跳跃线往外走，第一块「不是脚下那块」的顶面，它的中心就是目标中心。"""
     Hn = img.shape[0]
@@ -425,10 +425,13 @@ def find_face(img, fx, fy, angle_deg, Wn, kind='cream'):
     for side in (1, -1):
         ux, uy = side * math.cos(t), -math.sin(t)
         first, best = None, None
+        ox, oy = origin if origin else (fx, fy)                  # 沿跳跃线走的起点（预设 = 脚；也可以是脚下平台的中心）
+        if offset:                                               # 跳跃线往旁边平移 offset（垂直方向）
+            ox, oy = ox + offset * math.sin(t), oy + offset * side * math.cos(t)
         for s in range(2, int(1.3 * Wn)):
             if first is not None and s > first + 0.25 * Wn:
                 break
-            x, y = int(round(fx + ux * s)), int(round(fy + uy * s))
+            x, y = int(round(ox + ux * s)), int(round(oy + uy * s))
             if not (0 <= x < Wn and 0 <= y < Hn):
                 break
             L = int(lab[y, x])
@@ -576,6 +579,23 @@ def find_target(im, foot, angle_deg=30, diff_thr=45):
     Hn = img.shape[0]
     fx, fy = foot[0] * Wn, foot[1] * Wn
     face = find_face(img, fx, fy, angle_deg, Wn) or find_face(img, fx, fy, angle_deg, Wn, 'gold')   # 没有奶油色顶面 → 金币
+    if not face:
+        # 小人站在平台边边时，从脚出发的 30° 线会从小方块旁边擦过去（上次就这样漏掉一个小鼓）。
+        # 游戏是从「平台中心」沿 30° 摆下一个方块的 → 改从脚下平台的中心再找一次
+        cur = standing_face(im, foot)
+        if cur:
+            cx0, cy0 = cur['center'][0] * Wn, cur['center'][1] * Wn
+            if math.hypot(cx0 - fx, cy0 - fy) > 0.02 * Wn:
+                face = (find_face(img, fx, fy, angle_deg, Wn, origin=(cx0, cy0))
+                        or find_face(img, fx, fy, angle_deg, Wn, 'gold', origin=(cx0, cy0)))
+    if not face:
+        # 还是没有：把跳跃线往两旁平移一点点再找（离原本的线越近越优先），最多偏屏宽的 9%
+        for off in (0.03, -0.03, 0.06, -0.06, 0.09, -0.09):
+            face = (find_face(img, fx, fy, angle_deg, Wn, offset=off * Wn)
+                    or find_face(img, fx, fy, angle_deg, Wn, 'gold', offset=off * Wn))
+            if face:
+                face['method'] = face['method'] + '_band'
+                break
     if face:
         return face
     y0 = int(0.18 * Hn)
@@ -1027,6 +1047,14 @@ NOJUMP_DIFF = 2.5       # 按前、按后两张小灰阶图平均差小于这个
 TOUCH_GLITCH = 0.15     # 偏超过 15%：多半是按压没被完整认到（触控笔接触不良），不拿来做单跳校准、不算「装置变了」
 
 
+def is_result_screen(im):
+    """游戏结束后跳出来的结果视窗（「Keep Jumping」、折扣券…）：整个画面被盖暗。
+    结果视窗平均亮度约 72～79，正常游戏画面 161 以上（427 张截图）。"""
+    if im is None:
+        return False
+    return float(np.asarray(im.convert('L').resize((54, 120)), dtype=np.float32).mean()) < 120
+
+
 def scene_small(im):
     return np.asarray(im.convert('L').resize((60, 132)), dtype=np.float32)
 
@@ -1188,7 +1216,8 @@ def export(store, cfg, extra_info=None, all_shots=False):
     # 每一跳一行，Excel 可以直接打开（utf-8-sig 让 Excel 认得中文）
     rows = [['#', 'id', '时间', '谁', '距离', '按压ms', '当时k', '当时b', 'AI预测距离', 'AI小人信心',
              '落点偏差', '落点偏差%', '实际跳的距离', '结果(-1跳太远 0刚好 1跳太近)', '按下时间', 'ESP回报按完时间',
-             '故意偏离', '按之前的分数', '故意结束', '手机没反应']]
+             '故意偏离', '按之前的分数', '故意结束', '手机没反应', '手机认到按了几ms', '下指令到碰到屏幕ms', '跳跌倒',
+             '距离上次按完几秒', '先叫醒servo']]
     for i, r in enumerate(recs, 1):
         land = r.get('land') or {}
         units = (land.get('traveled', 0) - land.get('err', 0)) if land else 0
@@ -1198,7 +1227,10 @@ def export(store, cfg, extra_info=None, all_shots=False):
                      r.get('k_used', ''), r.get('b_used', ''), pred.get('units', ''), pred.get('score', ''),
                      land.get('err', ''), pct, land.get('traveled', ''), '' if r.get('r') is None else r['r'],
                      r.get('t_press', ''), r.get('t_done', ''), r.get('aim', ''), r.get('score', ''),
-                     'Y' if r.get('end_game') else '', 'Y' if r.get('no_jump') else ''])
+                     'Y' if r.get('end_game') else '', 'Y' if r.get('no_jump') else '',
+                     (r.get('touch') or {}).get('touch_ms', '没认到' if (r.get('touch') or {}).get('no_touch') else ''),
+                     (r.get('touch') or {}).get('touch_delay_ms', ''), 'Y' if r.get('fell') else '',
+                     r.get('idle', ''), {True: 'Y', False: 'N'}.get(r.get('wake'), '')])
     lc = land_count(store)
     sh = shadow_stats(store)
     ls = land_stats(store)
@@ -1211,6 +1243,7 @@ def export(store, cfg, extra_info=None, all_shots=False):
         f'瞄准左右修正（x_shift）：{cfg.get("x_shift", 0)}',
         f'手机没反应的按压：{sum(1 for r in recs if r.get("no_jump"))} 次（共 {len(recs)} 跳）',
         f'跳跌倒（游戏结束）：{sum(1 for r in recs if r.get("fell"))} 次',
+        touch_summary(recs),
         f'目前 k = {cfg.get("k")}, b = {cfg.get("b")}, 跳跃角度 {cfg.get("jump_angle_deg")}°, 投影 {cfg.get("gui_proj")}',
         '落点拟合：' + (f'k = {fl["k"]:.4f}, b = {fl["b"]:.1f}, 左右修正 {fl["k_side"]:+.1f} ms, 高度修正 {fl["k_foot"]:+.1f}'
                        f'（{fl["terms"]}，{fl["n"]} 跳，±{fl["rms"]:.1f} ms，另一半资料测 ±{fl["cv"]:.1f} ms）' if fl else '资料不够'),
@@ -1251,6 +1284,21 @@ def export(store, cfg, extra_info=None, all_shots=False):
             for f in sorted(os.listdir(FAILS)):
                 z.write(os.path.join(FAILS, f), 'fails/' + f, compress_type=zipfile.ZIP_STORED)
     return path
+
+
+def touch_summary(recs):
+    """手机真的认到的按压 vs 程式要求的：一行统计（导出 summary 用）。"""
+    t = [r for r in recs if r.get('touch')]
+    if not t:
+        return '手机触控纪录：没有（这个功能没开或手机不给读）'
+    ok = [r for r in t if 'touch_ms' in r['touch']]
+    miss = sum(1 for r in t if r['touch'].get('no_touch'))
+    if not ok:
+        return f'手机触控纪录：{len(t)} 跳，全部没认到触控'
+    d = np.array([r['touch']['touch_ms'] - r['ms'] for r in ok])
+    dl = np.array([r['touch']['touch_delay_ms'] for r in ok])
+    return (f'手机触控纪录：{len(t)} 跳，没认到 {miss} 次；手机认到的按压比要求的多 {np.median(d):+.0f} ms'
+            f'（±{np.std(d):.0f}，最少 {d.min():+.0f}、最多 {d.max():+.0f}）；下指令到碰到屏幕 {np.median(dl):.0f} ms（±{np.std(dl):.0f}）')
 
 
 def _event_time(line):
