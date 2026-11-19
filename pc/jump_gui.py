@@ -33,6 +33,7 @@ from PIL import Image, ImageTk
 import jump_bot as jb
 import learn
 import stream
+import touch
 
 FONT = ('Microsoft YaHei UI', 11)
 FONT_B = ('Microsoft YaHei UI', 11, 'bold')
@@ -58,6 +59,7 @@ class App:
         self.stream_starts = 0
         self.stream_tried = 0.0
         self.stream_watch = False
+        self.touch = None          # touch.TouchMonitor：手机真的认到的触控（每跳记下来）
         self.closing = False
         self.img = None            # 原始截图 (PIL)
         self.photo = None
@@ -454,6 +456,7 @@ class App:
             if not err:
                 self.awake_old = jb.keep_awake(self.adb)   # 接着 USB 时手机不休眠（暗掉时截图常卡住）
                 self.start_stream()
+                self.start_touch()
                 if not (jb.STREAM and jb.STREAM.alive):
                     jb.pick_screencap_mode(self.adb)   # 没有串流：测一下哪种截图方式比较快
             return err
@@ -492,11 +495,22 @@ class App:
                 self.stream_watch = True
                 threading.Thread(target=self.stream_watchdog, daemon=True).start()
 
+    def start_touch(self):
+        """开始读手机的触控事件（背景执行绪里呼叫）。读不到也没关系。"""
+        if self.touch is not None:
+            self.touch.stop()
+        self.touch = touch.TouchMonitor(self.adb)
+        ok = self.touch.start()
+        self.touch_tried = time.time()
+        self.store.event('touch_monitor', ok=ok, err=self.touch.error[:200])
+
     def stream_watchdog(self):
         """串流一断就马上在背景重开（不用等下一次截图才发现）。连续失败才慢慢拉长间隔。"""
         fails = 0
         while not self.closing:
             time.sleep(0.5)
+            if self.touch is not None and not self.touch.alive and time.time() - getattr(self, 'touch_tried', 0) > 20:
+                self.start_touch()                       # 读触控的 adb 断了（手机拔掉又插上…）：重开
             st = jb.STREAM
             if st is not None and st.alive:
                 fails = 0
@@ -935,10 +949,16 @@ class App:
     def handle_landing(self, land, pend, img=None, score_after=None, moved=None):
         jump, rec = pend
         self.store.save_after(rec, img)                 # 跳完的画面也存起来（导出用）
+        if self.touch is not None and rec.get('t_press'):
+            info = self.touch.claim(rec['t_press'], rec['ms'])   # 手机真的认到的按压时间
+            if info:
+                rec['touch'] = info
         if moved is not None and moved < learn.NOJUMP_DIFF and not rec.get('end_game') \
                 and (score_after is None or score_after == rec.get('score')):
             self.press_ignored(rec, moved); return
         self.ignored = 0
+        if learn.is_result_screen(img):                  # 跳完直接是结果视窗（暗掉的画面 + 折扣券）= 游戏结束
+            self.game_over(rec, img, score_after); return
         # 游戏自己的判定：分数一次加 5 分以上 = Perfect（落在中心附近）。比任何影像量测都可靠。
         before = rec.get('score')
         gain = (score_after - before) if (score_after is not None and before is not None) else None
@@ -1019,7 +1039,8 @@ class App:
         self.store.save()
         self.ignored += 1
         bad, n = learn.touch_stats(self.store)
-        self.store.event('press_ignored', id=rec['id'], ms=rec['ms'], diff=round(moved, 2), streak=self.ignored, recent=bad)
+        self.store.event('press_ignored', id=rec['id'], ms=rec['ms'], diff=round(moved, 2), streak=self.ignored, recent=bad,
+                         touch=rec.get('touch'))           # 手机有没有认到触控：没认到 = 触控笔问题；认到了 = 游戏没接受
         hint = '检查触控笔有没有碰到屏幕，可以把「压下」角度加 1～2 度'
         if self.ignored >= 3 and self.v_play.get():
             self.v_play.set(False)
@@ -1163,6 +1184,11 @@ class App:
                 self.root.after(700, lambda: self.refresh(stable=True))
                 return
             self.v_play.set(False)
+            if learn.is_result_screen(self.img):     # 结果视窗（游戏结束了）：不是认不出
+                self.store.save_fail(self.img, 'result')
+                self.store.event('ai_fail', err='结果视窗', why='result')
+                self.status('🏁 游戏结束了（结果视窗）。按「Keep Jumping」开新的一局后，再按「AI 自动玩」', 'warn')
+                return
             if self.img is not None:                 # 看不懂的画面存起来，导出时会带上
                 why = 'nochar' if 'score' in p and 'foot' not in p else 'notarget' if 'foot' in p else 'other'
                 self.store.save_fail(self.img, why)
@@ -1184,10 +1210,10 @@ class App:
         else:
             aim = self.pick_aim(p)
         ms = learn.ms_for(p['units'] + aim, p['side'], p['foot'][1], self.cfg, p.get('cur_width'))
-        # 上次按完到现在隔多久：隔超过约 2.7 秒，跳太近（按压被晚认到约 60 ms）的机会多很多。
-        # 实验：隔 2 秒以上的，一半先「叫醒」servo，一半不叫，下次导出就知道慢的是 servo 还是手机。
+        # 上次按完到现在隔多久：隔超过约 2.7 秒，跳太近（按压被晚认到约 60 ms）的机会多很多（所以按得快一点）。
+        # 「先叫醒 servo」的实验（11/20）：有叫没叫一样，已关掉。
         idle = time.time() - getattr(self, 'last_done', 0)
-        wake = idle >= 2.0 and random.random() < 0.5
+        wake = False
         if self.press(ms, wake=wake):
             if ending:
                 self.status(f'🏁 已到目标分数 {target}（现在 {self.score}）：故意失误，结束这一局', 'ok')
@@ -1297,6 +1323,8 @@ def main(update_note=''):
         try:
             if jb.STREAM is not None:
                 jb.STREAM.stop()
+            if app.touch is not None:
+                app.touch.stop()
         except Exception:  # noqa: BLE001
             pass
         if app.adb and app.awake_old is not None:
