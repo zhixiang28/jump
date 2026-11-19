@@ -88,7 +88,7 @@ class App:
         self.cfg.setdefault('miss_pct', 10)        # AI 自动玩时，故意不跳正中的机率（%）
         self.cfg.setdefault('miss_amount', 0.6)    # 故意偏离最多到「中心→边缘」距离的几成
         self.cfg.setdefault('target_score', 0)     # 目标分数：AI 自动玩到这个分数就故意失误结束（0 = 不限）
-        self.reset_msg = getattr(root, 'restore_note', '')
+        self.reset_msg = '\n'.join(x for x in (getattr(root, 'update_note', ''), getattr(root, 'restore_note', '')) if x)
         self.cfg['k_foot'] = 0                     # 「小人高度修正」已经拿掉（不稳定）
         if 'x_shift' not in self.cfg:              # 瞄准左右修正：第一次用从以前 Perfect 的那几跳估起始值
             self.cfg['x_shift'] = learn.x_shift_initial(self.store)
@@ -210,6 +210,10 @@ class App:
         self.v_live = tk.BooleanVar(value=False)
         self.v_calib = tk.BooleanVar(value=True)
         self.v_stream = check(c, '用影像串流取得画面（下次开启生效）', 'use_stream')
+        self.cfg.setdefault('auto_update', True)
+        self.v_update = check(c, '开启时自动更新（从 GitHub 下载新版本）', 'auto_update')
+        self.cfg.setdefault('export_all_shots', False)
+        self.v_export_all = check(c, '导出全部截图（档案很大；平常不用勾，只带有用的那几跳）', 'export_all_shots')
 
         # 学习卡
         c = card(colB, '🧠 学习')
@@ -1064,14 +1068,15 @@ class App:
         info = {'截图方式': jb.SCREENCAP_INFO, '画面来源': getattr(self, 'source_info', ''), '串流开启次数': self.stream_starts}
         if self.img:
             info['手机截图大小'] = f'{self.img.size[0]}x{self.img.size[1]}'
-        self.bg(lambda: learn.export(self.store, dict(self.cfg), info), self.after_export)
+        all_shots = bool(self.cfg.get('export_all_shots'))
+        self.bg(lambda: learn.export(self.store, dict(self.cfg), info, all_shots=all_shots), self.after_export)
 
     def after_export(self, path, err):
         self.export_btn.config(state='normal', text='📦 导出数据')
         if err:
             self.status(f'导出失败：{err}', 'err'); return
         size = os.path.getsize(path) / 1e6
-        self.status(f'已导出（{size:.1f} MB）：{path}\n把这个 zip 和录屏一起传给我', 'ok')
+        self.status(f'已导出（{size:.1f} MB）：{path}\n直接把这个 zip 传给我（不用解压）', 'ok')
         try:                                           # 打开资料夹、选中这个档案
             if sys.platform.startswith('win'):
                 subprocess.Popen(['explorer', '/select,', os.path.normpath(path)])
@@ -1127,6 +1132,10 @@ class App:
                 self.root.after(700, lambda: self.refresh(stable=True))
                 return
             self.v_play.set(False)
+            if self.img is not None:                 # 看不懂的画面存起来，导出时会带上
+                why = 'nochar' if 'score' in p and 'foot' not in p else 'notarget' if 'foot' in p else 'other'
+                self.store.save_fail(self.img, why)
+                self.store.event('ai_fail', err=str(p.get('err', ''))[:200], why=why)
             self.status(f'⏸ AI 停下来了：{p.get("err", "看不懂这个画面")}。请手动画这一跳', 'warn')
             return
         self.auto_fail = 0
@@ -1230,7 +1239,7 @@ def restore_from_profiles():
         return f'搬回手机设定时出错（{e}），用 pc 资料夹里原本的设定'
 
 
-def main():
+def main(update_note=''):
     try:   # Windows 高解析度萤幕：避免视窗模糊、座标偏移
         import ctypes
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
@@ -1238,6 +1247,7 @@ def main():
         pass
     root = tk.Tk()
     root.restore_note = restore_from_profiles()
+    root.update_note = update_note
     app = App(root)
 
     def on_close():                                  # 关视窗时把手机的休眠设定还原、关掉串流、断开蓝牙

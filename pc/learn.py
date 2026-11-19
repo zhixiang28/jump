@@ -27,6 +27,9 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(HERE, 'data')
 SHOTS = os.path.join(DATA, 'shots')
 LOG = os.path.join(DATA, 'log.json')
+FAILS = os.path.join(DATA, 'fails')      # AI 看不懂、停下来的那几张画面（导出给 Claude 看）
+MAX_FAILS = 20
+EVENTS_MAX_BYTES = 4_000_000             # 操作纪录超过这么大就只留后半段
 EVENTS = os.path.join(DATA, 'events.csv')
 EXPORT = os.path.join(HERE, 'export')
 
@@ -61,6 +64,35 @@ class Store:
             pass
         except Exception as e:  # noqa: BLE001
             print('学习纪录读不了，重新开始：', e)
+        self._trim_events()
+
+    def _trim_events(self):
+        """操作纪录会一直变大：超过 EVENTS_MAX_BYTES 就只留后半段（导出只需要最近 300 跳那段时间）。"""
+        try:
+            if os.path.getsize(EVENTS) <= EVENTS_MAX_BYTES:
+                return
+            with open(EVENTS, encoding='utf-8') as f:
+                lines = f.readlines()
+            keep = lines[:1] + lines[len(lines) // 2:]
+            tmp = EVENTS + '.tmp'
+            with open(tmp, 'w', encoding='utf-8', newline='') as f:
+                f.writelines(keep)
+            os.replace(tmp, EVENTS)
+        except OSError:
+            pass
+
+    def save_fail(self, im, why):
+        """AI 看不懂、停下来的画面存起来（data/fails/，只留最近 MAX_FAILS 张），导出时会带上。"""
+        try:
+            os.makedirs(FAILS, exist_ok=True)
+            W, H = im.size
+            name = time.strftime('%Y%m%d-%H%M%S') + '_' + ''.join(c for c in why if c.isascii() and c.isalnum())[:20]
+            im.resize((NW, round(H * NW / W)), Image.BILINEAR).save(os.path.join(FAILS, name + '.jpg'), quality=90)
+            files = sorted(f for f in os.listdir(FAILS) if f.endswith('.jpg'))
+            for f in files[:-MAX_FAILS]:
+                os.remove(os.path.join(FAILS, f))
+        except Exception as e:  # noqa: BLE001
+            print('看不懂的画面存不了：', e)
 
     def save(self):
         tmp = LOG + '.tmp'
@@ -82,7 +114,8 @@ class Store:
                'r': None, 'est': None,
                'pred': ({'units': round(pred['units'], 1), 'score': round(pred['score'], 3),
                          'foot': [round(v, 4) for v in pred['foot']], 'center': [round(v, 4) for v in pred['center']],
-                         'width': round(pred.get('width') or 0, 3), 'cur_width': round(pred.get('cur_width') or 0, 3)}
+                         'width': round(pred.get('width') or 0, 3), 'cur_width': round(pred.get('cur_width') or 0, 3),
+                         'method': pred.get('method', 'face')}
                         if pred and 'foot' in pred else None)}
         if extra:
             rec.update({k: v for k, v in extra.items() if k not in rec})   # 不覆盖原本的栏位
@@ -1099,8 +1132,53 @@ def fit_kb(store, proj=True):
 
 
 # ================================================================ 导出
-def export(store, cfg, extra_info=None):
-    """把学习纪录、设定、操作纪录、截图打包成一个 zip（pc/export/）。回传 zip 路径。"""
+def select_shots(recs, max_n=60, n_last=5, n_sample=8):
+    """精简导出：挑出「有用」的那几跳（只带它们的截图）。回传 {id: [原因, ...]}，依重要程度挑，最多 max_n 跳。
+    数字资料（log.json）还是每一跳都有，只是截图挑过。"""
+    pick = {}
+
+    def add(r, why):
+        if r['id'] in pick:
+            pick[r['id']].append(why)
+        elif len(pick) < max_n:
+            pick[r['id']] = [why]
+    rule_lists = [[] for _ in range(8)]
+    for i, r in enumerate(recs):
+        land, gain, aim = r.get('land') or {}, r.get('score_gain'), r.get('aim') or 0
+        p = r.get('pred') or {}
+        if r.get('no_jump'):
+            rule_lists[0].append((r, '手机没反应'))
+        if gain == 0 or (r.get('auto') and not land and not r.get('no_jump')):
+            rule_lists[0].append((r, '掉下去/游戏结束' if gain == 0 else '量不到落点'))
+            for j in (i - 2, i - 1):                    # 出事之前那两跳（看是怎么走到边缘的）
+                if j >= 0:
+                    rule_lists[3].append((recs[j], '出事前'))
+        if gain is not None and 1 <= gain <= 4 and not aim:
+            rule_lists[1].append((r, '没拿到 Perfect'))
+        if land and not land.get('perfect_fix') and abs(land.get('err', 0) - aim) > 0.05 * max(1.0, r['units']):
+            rule_lists[2].append((r, '偏超过 5%'))
+        if not r.get('auto'):
+            far = not p.get('center') or math.hypot(p['center'][0] - r['b'][0], p['center'][1] - r['b'][1]) > 0.05
+            if far:
+                rule_lists[1].append((r, 'AI 认不出目标（你画的）'))
+        if p.get('method') in ('memory', 'gold', 'shape'):
+            rule_lists[4].append((r, f'特别的目标（{p["method"]}）'))
+        if r.get('end_game'):
+            rule_lists[5].append((r, '故意结束'))
+    rule_lists[6] = [(r, '最后几跳') for r in recs[-n_last:]]
+    normal = [r for r in recs if r['id'] not in {x[0]['id'] for lst in rule_lists for x in lst}
+              and (r.get('score_gain') or 0) >= 5 and r.get('land')]
+    step = max(1, len(normal) // max(1, n_sample))
+    rule_lists[7] = [(r, '正常的抽样（对照用）') for r in normal[::step][:n_sample]]
+    for lst in rule_lists:
+        for r, why in lst[:20] if lst is rule_lists[4] else lst:
+            add(r, why)
+    return pick
+
+
+def export(store, cfg, extra_info=None, all_shots=False):
+    """把学习纪录、设定、操作纪录、截图打包成一个 zip（pc/export/）。回传 zip 路径。
+    预设只带「有用」那几跳的截图（select_shots）；all_shots=True 带全部。"""
     os.makedirs(EXPORT, exist_ok=True)
     name = 'servo_export_' + time.strftime('%Y%m%d-%H%M%S') + '.zip'
     path = os.path.join(EXPORT, name)
@@ -1146,14 +1224,38 @@ def export(store, cfg, extra_info=None):
         buf = __import__('io').StringIO()
         csv.writer(buf).writerows(rows)
         z.writestr('jumps.csv', '\ufeff' + buf.getvalue())
-        if os.path.exists(EVENTS):
-            z.write(EVENTS, 'events.csv')
+        if os.path.exists(EVENTS):                    # 只带最近这 300 跳那段时间的操作纪录
+            t0 = min([r.get('t_press') or 0 for r in recs if r.get('t_press')] or [0]) - 600
+            try:
+                with open(EVENTS, encoding='utf-8') as f:
+                    lines = f.readlines()
+                keep = lines[:1] + [ln for ln in lines[1:] if _event_time(ln) >= t0]
+                z.writestr('events.csv', ''.join(keep))
+            except OSError:
+                z.write(EVENTS, 'events.csv')
+        chosen = {r['id']: ['全部导出'] for r in recs} if all_shots else select_shots(recs)
         for r in recs:
+            if r['id'] not in chosen:
+                continue
             for suffix in ('.jpg', '_after.jpg'):
                 f = os.path.join(SHOTS, r['id'] + suffix)
                 if os.path.exists(f):
                     z.write(f, 'shots/' + r['id'] + suffix, compress_type=zipfile.ZIP_STORED)
+        num = {r['id']: i for i, r in enumerate(recs, 1)}
+        z.writestr('selected.txt', '\n'.join(
+            [f'截图：{len(chosen)} 跳（共 {len(recs)} 跳）' + ('，全部导出' if all_shots else '，只挑有用的') ]
+            + [f'#{num[i]}  {i}  {"、".join(w)}' for i, w in sorted(chosen.items(), key=lambda x: num[x[0]])]))
+        if os.path.isdir(FAILS):
+            for f in sorted(os.listdir(FAILS)):
+                z.write(os.path.join(FAILS, f), 'fails/' + f, compress_type=zipfile.ZIP_STORED)
     return path
+
+
+def _event_time(line):
+    try:
+        return float(line.split(',', 1)[0])
+    except ValueError:
+        return 0.0
 
 
 # ================================================================ 读分数（画面上方的白色大数字）
