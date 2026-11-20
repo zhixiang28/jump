@@ -85,6 +85,7 @@ class App:
         self.ignored = 0           # 连续几次按压手机没反应（小人没跳）
         self.touch_hist = []       # 最近 AI 按压，手机认到的情况：'ok' / 'none'（没认到）/ 'short'（认到的少 40 ms 以上）
         self.since_angle = 15      # 距离上次自动调角度几跳
+        self.touch_lost = []       # 最近 30 跳手机认到的按压比要求的少几 ms（看抖动）
         self.score = None          # 画面上读到的分数
         self.shot_fail = 0         # 连续截图失败次数
         self.awake_old = None      # 手机原本的「接着电源不休眠」设定（结束时还原）
@@ -838,12 +839,21 @@ class App:
         none, severe = self.touch_hist.count('none'), self.touch_hist.count('severe')
         short = self.touch_hist.count('short') + severe
         # 按到一半断掉（少 100 ms 以上）会直接跌倒：没认到 + 认到很短的合计 3 次，或严重的 2 次，就加深
-        if not self.cfg.get('auto_angle', True) or self.since_angle < 15 or not (none + short >= 3 or none + severe >= 2):
+        bad = none + short >= 3 or none + severe >= 2
+        # 按压时间抖动：压得深一点，手机认到的时间比较稳（11/20：96° 偏短那侧抖 17 ms、98° 只有 10 ms）。
+        # 最近 30 跳「中位数 - 第 10 百分位」超过 12 ms，也加深 1°（这个条件每次至少隔 30 跳）
+        self.touch_lost.append(lost if 'touch_ms' in t else None)
+        del self.touch_lost[:-30]
+        vals = sorted(v for v in self.touch_lost if v is not None)
+        jitter = (vals[len(vals) // 2] - vals[len(vals) // 10]) if len(vals) >= 25 else 0
+        shaky = jitter > 12 and self.since_angle >= 30
+        if not self.cfg.get('auto_angle', True) or self.since_angle < 15 or not (bad or shaky):
             return
         rest, push = int(self.cfg.get('servo_rest', 0)), int(self.cfg.get('servo_push', 90))
         base = int(self.cfg.setdefault('servo_push_base', push))
         new = push + (1 if push >= rest else -1)        # 往「压下」的方向多 1°
-        why = f'最近 15 跳手机没认到 {none} 次、认到的少 40 ms 以上 {short} 次'
+        why = (f'最近 15 跳手机没认到 {none} 次、认到的少 40 ms 以上 {short} 次' if bad
+               else f'按压时间抖动 {jitter:.0f} ms（压深一点会比较稳）')
         if abs(new - base) > 4:
             self.status(f'⚠ {why}，压下角度已经自动加深 4°，还是不稳：请检查触控笔头和 servo 电源', 'warn')
             self.since_angle = 0
@@ -856,10 +866,10 @@ class App:
         finally:
             self.root.after(50, lambda: setattr(self, '_setting_angles', False))
         self.bg_async(self.esp.send(f'A{rest},{new}'), lambda *_: None)
-        self.store.event('auto_angle', old=push, new=new, base=base, none=none, short=short)
+        self.store.event('auto_angle', old=push, new=new, base=base, none=none, short=short, jitter=round(jitter, 1))
         self.ang_lbl.config(text=f'自动调整：压下 {push}° → {new}°（你设的是 {base}°）')
         self.status(f'🦾 {why}：压下角度自动加深 1°（{push}° → {new}°）', 'warn')
-        self.touch_hist, self.since_angle = [], 0
+        self.touch_hist, self.touch_lost, self.since_angle = [], [], 0
 
     def save_angles(self, then=None):
         if not self.esp:
